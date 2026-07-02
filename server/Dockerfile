@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # LibreOffice para conversión server-side de docx/xlsx/pptx → PDF
 RUN apt-get update && apt-get install -y \
