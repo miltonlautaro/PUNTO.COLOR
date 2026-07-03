@@ -406,43 +406,106 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ── Páginas de retorno de Mercado Pago ───────────────────────────────────────
-// Placeholders hasta que el dominio esté activo.
+// Primera pantalla que ve el cliente justo después de pagar — usan la
+// identidad visual del sitio (misma paleta y tipografías que el frontend).
+const FRONTEND_URL = 'https://www.puntocolorimpresiones.com';
+
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
+function paginaPago({ emoji, titulo, mensaje, colorAccent, pedidoId, extraLinea }) {
+  const pedido = pedidoId ? escapeHtml(pedidoId) : '—';
+  return `
+    <!DOCTYPE html>
+    <html lang="es">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>Punto Color — ${escapeHtml(titulo)}</title>
+      <link rel="preconnect" href="https://fonts.googleapis.com">
+      <link href="https://fonts.googleapis.com/css2?family=Fredoka+One&family=Nunito:wght@400;700&display=swap" rel="stylesheet">
+      <style>
+        body{
+          margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+          background:#f5e8d0;font-family:'Nunito',sans-serif;color:#1a1009;padding:24px;box-sizing:border-box;
+        }
+        .card{
+          background:#fff;border-radius:20px;padding:40px 32px;max-width:420px;width:100%;
+          text-align:center;box-shadow:0 12px 40px rgba(26,16,9,.15);
+        }
+        .logo{font-family:'Fredoka One',sans-serif;font-size:1.4rem;margin-bottom:20px}
+        .logo .punto{color:#1a1009}
+        .logo .color{color:${colorAccent}}
+        .emoji{font-size:3rem;margin-bottom:8px}
+        h1{font-family:'Fredoka One',sans-serif;font-size:1.3rem;color:${colorAccent};margin:0 0 12px}
+        p{font-size:.95rem;line-height:1.5;margin:6px 0}
+        .pedido-box{
+          background:#f5e8d0;border-radius:12px;padding:12px 16px;margin:20px 0;
+          font-size:.85rem;color:#4a2e0a;
+        }
+        .pedido-box strong{color:#1a1009}
+        a.volver{
+          display:inline-block;margin-top:16px;background:#1a1009;color:#f5e8cf;
+          font-family:'Fredoka One',sans-serif;font-size:.85rem;text-decoration:none;
+          padding:12px 24px;border-radius:30px;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div class="logo"><span class="punto">Punto</span> <span class="color">Color</span></div>
+        <div class="emoji">${emoji}</div>
+        <h1>${escapeHtml(titulo)}</h1>
+        <p>${escapeHtml(mensaje)}</p>
+        <div class="pedido-box">
+          Pedido: <strong>${pedido}</strong>
+          ${extraLinea ? `<br>${escapeHtml(extraLinea)}` : ''}
+        </div>
+        <a class="volver" href="${FRONTEND_URL}">Volver a Punto Color</a>
+      </div>
+    </body>
+    </html>
+  `;
+}
 
 app.get('/pago/success', (req, res) => {
   const { external_reference, payment_id, status } = req.query;
   console.log('MP success redirect:', { external_reference, payment_id, status });
-  res.send(`
-    <html><body style="font-family:sans-serif;text-align:center;padding:40px">
-      <h2>✅ ¡Pago aprobado!</h2>
-      <p>Pedido: <strong>${external_reference ?? '—'}</strong></p>
-      <p>Número de pago: ${payment_id ?? '—'}</p>
-      <p><small>(Página temporal — se reemplaza cuando el dominio esté activo)</small></p>
-    </body></html>
-  `);
+  res.send(paginaPago({
+    emoji: '✅',
+    titulo: '¡Pago aprobado!',
+    mensaje: 'Recibimos tu pago y ya estamos preparando tu pedido.',
+    colorAccent: '#2ec4b6',
+    pedidoId: external_reference,
+    extraLinea: payment_id ? `Número de pago: ${payment_id}` : null,
+  }));
 });
 
 app.get('/pago/failure', (req, res) => {
   const { external_reference } = req.query;
   console.log('MP failure redirect:', { external_reference });
-  res.send(`
-    <html><body style="font-family:sans-serif;text-align:center;padding:40px">
-      <h2>❌ El pago no se pudo procesar</h2>
-      <p>Pedido: <strong>${external_reference ?? '—'}</strong></p>
-      <p><small>(Página temporal)</small></p>
-    </body></html>
-  `);
+  res.send(paginaPago({
+    emoji: '❌',
+    titulo: 'El pago no se pudo procesar',
+    mensaje: 'No te preocupes, no se realizó ningún cobro. Podés intentar de nuevo desde el sitio.',
+    colorAccent: '#e8453c',
+    pedidoId: external_reference,
+  }));
 });
 
 app.get('/pago/pending', (req, res) => {
   const { external_reference } = req.query;
   console.log('MP pending redirect:', { external_reference });
-  res.send(`
-    <html><body style="font-family:sans-serif;text-align:center;padding:40px">
-      <h2>⏳ Pago pendiente</h2>
-      <p>Pedido: <strong>${external_reference ?? '—'}</strong></p>
-      <p><small>(Página temporal)</small></p>
-    </body></html>
-  `);
+  res.send(paginaPago({
+    emoji: '⏳',
+    titulo: 'Pago pendiente',
+    mensaje: 'Tu pago está siendo procesado. Te avisaremos apenas se confirme.',
+    colorAccent: '#f5a623',
+    pedidoId: external_reference,
+  }));
 });
 
 const PORT = process.env.PORT || 3001;
