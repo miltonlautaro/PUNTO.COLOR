@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Punto Color — Panel de pedidos</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka+One&family=Nunito:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{ --kraft:#f5e8d0; --ink:#1a1009; --accent:#e8453c; --ok:#2ec4b6; }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Nunito',sans-serif;background:var(--kraft);color:var(--ink);min-height:100vh}
+  header{background:var(--ink);color:#f5e8cf;padding:18px 24px;font-family:'Fredoka One',sans-serif;font-size:1.3rem}
+  header span{color:#ff8a75}
+  main{max-width:1000px;margin:0 auto;padding:24px}
+
+  #login-box{max-width:360px;margin:60px auto;background:#fff;border-radius:16px;padding:32px;box-shadow:0 10px 30px rgba(26,16,9,.12);text-align:center}
+  #login-box h2{font-family:'Fredoka One',sans-serif;font-size:1.1rem;margin:0 0 20px}
+  #login-box input{width:100%;padding:12px;margin-bottom:12px;border:1px solid #ddd;border-radius:10px;font-family:'Nunito',sans-serif;font-size:.95rem}
+  #login-box button{width:100%;padding:12px;background:var(--ink);color:#f5e8cf;border:none;border-radius:30px;font-family:'Fredoka One',sans-serif;font-size:.9rem;cursor:pointer}
+  #login-msg{color:var(--accent);font-size:.85rem;margin-top:10px;min-height:18px}
+
+  .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
+  .toolbar button{background:none;border:1px solid var(--ink);color:var(--ink);padding:8px 16px;border-radius:20px;font-family:'Nunito',sans-serif;font-weight:700;font-size:.85rem;cursor:pointer}
+
+  .pedido-card{background:#fff;border-radius:16px;padding:20px;margin-bottom:16px;box-shadow:0 6px 20px rgba(26,16,9,.08)}
+  .pedido-head{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:10px}
+  .pedido-id{font-family:'Fredoka One',sans-serif;font-size:.95rem}
+  .estado-badge{font-size:.75rem;font-weight:800;padding:4px 12px;border-radius:20px;text-transform:uppercase}
+  .estado-pendiente{background:#fde3b0;color:#7a4a00}
+  .estado-pagado{background:#cdeee9;color:#166b62}
+  .estado-completado{background:#dcecc9;color:#3f6b1f}
+
+  .pedido-info{font-size:.85rem;line-height:1.6;color:#4a2e0a;margin-bottom:12px}
+  .pedido-info strong{color:var(--ink)}
+
+  .archivos-list{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+  .archivos-list a{
+    background:var(--kraft);color:var(--ink);text-decoration:none;font-size:.8rem;font-weight:700;
+    padding:6px 12px;border-radius:20px;
+  }
+  .archivos-list .sin-archivos{color:#999;font-style:italic;font-size:.8rem}
+
+  .completar-btn{
+    background:var(--ok);color:#fff;border:none;padding:8px 18px;border-radius:20px;
+    font-family:'Fredoka One',sans-serif;font-size:.8rem;cursor:pointer;
+  }
+  .completar-btn:disabled{opacity:.5;cursor:default}
+
+  #estado-carga, #estado-vacio{text-align:center;padding:60px 0;color:#7a5a2a}
+  #app{display:none}
+</style>
+</head>
+<body>
+
+<header>Punto <span>Color</span> — Panel de pedidos</header>
+
+<main>
+  <div id="login-box">
+    <h2>Iniciá sesión</h2>
+    <input id="login-email" type="email" placeholder="Email">
+    <input id="login-pass" type="password" placeholder="Contraseña">
+    <button onclick="login()">Entrar</button>
+    <div id="login-msg"></div>
+  </div>
+
+  <div id="app">
+    <div class="toolbar">
+      <button onclick="cargarPedidos()">↻ Actualizar</button>
+      <button onclick="logout()">Cerrar sesión</button>
+    </div>
+    <div id="estado-carga">Cargando pedidos...</div>
+    <div id="estado-vacio" style="display:none">No hay pedidos todavía.</div>
+    <div id="pedidos-list"></div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script>
+const PC_SERVER = 'https://api.puntocolorimpresiones.com';
+const sb = supabase.createClient(
+  'https://bdezjzqizywgyumpspdi.supabase.co',
+  'sb_publishable_PBFkAWpGBQ2ZMcYg_H4zPQ_HpnZlvbd'
+);
+
+function fmtFecha(iso){
+  return new Date(iso).toLocaleString('es-AR', { dateStyle:'short', timeStyle:'short' });
+}
+function fmtMoney(n){
+  return n == null ? '—' : '$ ' + Number(n).toLocaleString('es-AR');
+}
+function escapeHtml(str){
+  const div = document.createElement('div');
+  div.textContent = str ?? '';
+  return div.innerHTML;
+}
+
+async function getToken(){
+  const { data } = await sb.auth.getSession();
+  return data?.session?.access_token || null;
+}
+
+async function login(){
+  const email = document.getElementById('login-email').value.trim();
+  const pass  = document.getElementById('login-pass').value;
+  const msgEl = document.getElementById('login-msg');
+  msgEl.textContent = '';
+  if (!email || !pass) { msgEl.textContent = 'Completá email y contraseña'; return; }
+
+  const { error } = await sb.auth.signInWithPassword({ email, password: pass });
+  if (error) { msgEl.textContent = 'Credenciales incorrectas'; return; }
+  await mostrarApp();
+}
+
+async function logout(){
+  await sb.auth.signOut();
+  document.getElementById('app').style.display = 'none';
+  document.getElementById('login-box').style.display = 'block';
+}
+
+async function mostrarApp(){
+  document.getElementById('login-box').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  await cargarPedidos();
+}
+
+async function cargarPedidos(){
+  const listEl   = document.getElementById('pedidos-list');
+  const cargaEl  = document.getElementById('estado-carga');
+  const vacioEl  = document.getElementById('estado-vacio');
+  listEl.innerHTML = '';
+  cargaEl.style.display = 'block';
+  vacioEl.style.display = 'none';
+
+  const token = await getToken();
+  try {
+    const res = await fetch(PC_SERVER + '/admin/pedidos', {
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (res.status === 401 || res.status === 403) {
+      cargaEl.style.display = 'none';
+      document.getElementById('login-msg').textContent = 'No tenés permisos de administrador para esta cuenta';
+      await logout();
+      return;
+    }
+    const data = await res.json();
+    cargaEl.style.display = 'none';
+    if (!data.pedidos || data.pedidos.length === 0) {
+      vacioEl.style.display = 'block';
+      return;
+    }
+    data.pedidos.forEach(p => listEl.appendChild(renderPedido(p)));
+  } catch (err) {
+    cargaEl.textContent = 'Error al cargar pedidos. Reintentá con el botón Actualizar.';
+  }
+}
+
+function renderPedido(p){
+  const div = document.createElement('div');
+  div.className = 'pedido-card';
+
+  const estadoClass = 'estado-' + (p.estado || 'pendiente');
+  const archivosHtml = (p.archivosStorage && p.archivosStorage.length > 0)
+    ? p.archivosStorage.map(a => `<a href="${a.url || '#'}" target="_blank" rel="noopener">⬇ ${escapeHtml(a.nombre)}</a>`).join('')
+    : '<span class="sin-archivos">Sin archivos</span>';
+
+  const config = p.config || {};
+  const specs = [
+    config.tinta, config.cara, config.acabado,
+    p.copies ? `${p.copies} copia(s)` : null,
+    p.hojas ? `${p.hojas} hoja(s)` : null,
+  ].filter(Boolean).join(' · ');
+
+  div.innerHTML = `
+    <div class="pedido-head">
+      <div class="pedido-id">${escapeHtml(p.pedido_id)}</div>
+      <div class="estado-badge ${estadoClass}">${escapeHtml(p.estado || 'pendiente')}</div>
+    </div>
+    <div class="pedido-info">
+      <strong>Fecha:</strong> ${fmtFecha(p.created_at)}<br>
+      <strong>Cliente:</strong> ${escapeHtml(p.email || '—')} ${p.whatsapp ? '· ' + escapeHtml(p.whatsapp) : ''}<br>
+      <strong>Specs:</strong> ${escapeHtml(specs || '—')}<br>
+      <strong>Zona:</strong> ${escapeHtml(p.zona || '—')} · <strong>Total:</strong> ${fmtMoney(p.total)}
+    </div>
+    <div class="archivos-list">${archivosHtml}</div>
+  `;
+
+  if (p.estado === 'pagado') {
+    const btn = document.createElement('button');
+    btn.className = 'completar-btn';
+    btn.textContent = '✓ Marcar como completado';
+    btn.onclick = () => completarPedido(p.pedido_id, btn);
+    div.appendChild(btn);
+  }
+
+  return div;
+}
+
+async function completarPedido(pedidoId, btnEl){
+  btnEl.disabled = true;
+  btnEl.textContent = 'Guardando...';
+  const token = await getToken();
+  try {
+    const res = await fetch(PC_SERVER + '/admin/pedidos/' + encodeURIComponent(pedidoId) + '/completar', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token }
+    });
+    if (!res.ok) throw new Error();
+    await cargarPedidos();
+  } catch (err) {
+    btnEl.disabled = false;
+    btnEl.textContent = '✓ Marcar como completado';
+    alert('No se pudo actualizar el pedido. Reintentá.');
+  }
+}
+
+(async function init(){
+  const { data } = await sb.auth.getSession();
+  if (data?.session) await mostrarApp();
+})();
+</script>
+</body>
+</html>

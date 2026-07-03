@@ -228,6 +228,60 @@ app.post('/admin/limpiar-huerfanos', async (req, res) => {
   }
 });
 
+// ── Panel de administración: ver pedidos y archivos, marcar completados ─────
+async function requireAdmin(req, res, next) {
+  const authHeader = req.headers['authorization'] || '';
+  const token = authHeader.replace('Bearer ', '').trim();
+  if (!token) return res.status(401).json({ error: 'Se requiere sesión' });
+
+  const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+  if (authErr || !user) return res.status(401).json({ error: 'Sesión inválida' });
+
+  const { data: profile, error: profileErr } = await supabase
+    .from('profiles')
+    .select('is_admin')
+    .eq('id', user.id)
+    .single();
+  if (profileErr || !profile?.is_admin) return res.status(403).json({ error: 'No autorizado' });
+
+  next();
+}
+
+app.get('/admin/pedidos', requireAdmin, async (req, res) => {
+  const { data: pedidos, error } = await supabase
+    .from('pedidos')
+    .select('*')
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+
+  const conArchivos = await Promise.all(pedidos.map(async (p) => {
+    let archivosStorage = [];
+    try {
+      const files = await listAllStorage(p.pedido_id);
+      archivosStorage = await Promise.all(files.map(async (f) => {
+        const path = `${p.pedido_id}/${f.name}`;
+        const { data: signed } = await supabase.storage.from(BUCKET).createSignedUrl(path, 3600);
+        return { nombre: f.name, url: signed?.signedUrl || null };
+      }));
+    } catch (err) {
+      console.error(`Error listando archivos de ${p.pedido_id}:`, err.message);
+    }
+    return { ...p, archivosStorage };
+  }));
+
+  return res.json({ pedidos: conArchivos });
+});
+
+app.post('/admin/pedidos/:pedidoId/completar', requireAdmin, async (req, res) => {
+  const { pedidoId } = req.params;
+  const { error } = await supabase
+    .from('pedidos')
+    .update({ estado: 'completado' })
+    .eq('pedido_id', pedidoId);
+  if (error) return res.status(500).json({ error: error.message });
+  return res.json({ ok: true });
+});
+
 // ── Crear preferencia MP + registrar pedido en Supabase ──────────────────────
 app.post('/checkout', async (req, res) => {
   const {
