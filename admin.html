@@ -35,10 +35,16 @@
   .pedido-info strong{color:var(--ink)}
 
   .archivos-list{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+  .archivo-item{display:flex;gap:4px;align-items:center}
   .archivos-list a{
     background:var(--kraft);color:var(--ink);text-decoration:none;font-size:.8rem;font-weight:700;
-    padding:6px 12px;border-radius:20px;
+    padding:6px 12px;border-radius:20px 0 0 20px;
   }
+  .imprimir-btn{
+    background:var(--ink);color:#f5e8cf;border:none;font-size:.8rem;font-weight:700;
+    padding:6px 12px;border-radius:0 20px 20px 0;cursor:pointer;font-family:'Nunito',sans-serif;
+  }
+  .imprimir-btn:disabled{opacity:.5;cursor:default}
   .archivos-list .sin-archivos{color:#999;font-style:italic;font-size:.8rem}
 
   .completar-btn{
@@ -161,7 +167,13 @@ function renderPedido(p){
 
   const estadoClass = 'estado-' + (p.estado || 'pendiente');
   const archivosHtml = (p.archivosStorage && p.archivosStorage.length > 0)
-    ? p.archivosStorage.map(a => `<a href="${a.url || '#'}" target="_blank" rel="noopener">⬇ ${escapeHtml(a.nombre)}</a>`).join('')
+    ? p.archivosStorage.map(a => `
+        <span class="archivo-item">
+          <a href="${a.url || '#'}" target="_blank" rel="noopener">⬇ ${escapeHtml(a.nombre)}</a>
+          <button class="imprimir-btn" ${a.url ? '' : 'disabled'}
+            onclick='imprimirArchivo(${JSON.stringify(a.url)}, ${JSON.stringify(p.pedido_id)}, ${JSON.stringify(p.estado)}, this)'>🖨️</button>
+        </span>
+      `).join('')
     : '<span class="sin-archivos">Sin archivos</span>';
 
   const config = p.config || {};
@@ -197,8 +209,6 @@ function renderPedido(p){
 }
 
 async function completarPedido(pedidoId, btnEl){
-  btnEl.disabled = true;
-  btnEl.textContent = 'Guardando...';
   const token = await getToken();
   try {
     const res = await fetch(PC_SERVER + '/admin/pedidos/' + encodeURIComponent(pedidoId) + '/completar', {
@@ -208,9 +218,46 @@ async function completarPedido(pedidoId, btnEl){
     if (!res.ok) throw new Error();
     await cargarPedidos();
   } catch (err) {
-    btnEl.disabled = false;
-    btnEl.textContent = '✓ Marcar como completado';
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = '✓ Marcar como completado'; }
     alert('No se pudo actualizar el pedido. Reintentá.');
+  }
+}
+
+// Abre el PDF en una pestaña propia (mismo origen, vía blob) para poder
+// disparar window.print() y escuchar 'afterprint' — un PDF cross-origin
+// (el signed URL de Supabase) no permite ninguna de las dos cosas.
+async function imprimirArchivo(url, pedidoId, estadoActual, btnEl){
+  if (!url) return;
+  btnEl.disabled = true;
+  const originalText = btnEl.textContent;
+  btnEl.textContent = '...';
+  try {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error();
+    const blob = await res.blob();
+    const blobUrl = URL.createObjectURL(blob);
+    const w = window.open(blobUrl, '_blank');
+    if (!w) {
+      alert('El navegador bloqueó la ventana de impresión. Permití pop-ups para este sitio.');
+      return;
+    }
+    w.addEventListener('load', () => {
+      setTimeout(() => { try { w.print(); } catch(e){} }, 300);
+    });
+    // afterprint se dispara al cerrar el diálogo, imprima o cancele el
+    // usuario — el navegador no expone cuál de las dos pasó. Por eso
+    // preguntamos explícitamente antes de marcar el pedido como completado.
+    w.addEventListener('afterprint', () => {
+      URL.revokeObjectURL(blobUrl);
+      if (estadoActual === 'pagado' && confirm('¿Se imprimió correctamente este archivo?')) {
+        completarPedido(pedidoId);
+      }
+    });
+  } catch (err) {
+    alert('No se pudo abrir el archivo para imprimir.');
+  } finally {
+    btnEl.disabled = false;
+    btnEl.textContent = originalText;
   }
 }
 
