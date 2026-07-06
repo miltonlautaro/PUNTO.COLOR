@@ -283,30 +283,59 @@ app.post('/admin/pedidos/:pedidoId/completar', requireAdmin, async (req, res) =>
 });
 
 // ── Crear preferencia MP + registrar pedido en Supabase ──────────────────────
-app.post('/checkout', async (req, res) => {
-  const {
-    pedidoId, total, totalSinDescuento, subtotalImp, subtotalEnv,
-    zona, copies, pages, hojas, precioPorHoja,
-    acabPrice, carasImpresas, config, direccion,
-    archivos, email, whatsapp, codigo,
-  } = req.body;
+// Máximo de pedidos (ítems) que se pueden combinar en un solo carrito/pago.
+// No corresponde a un límite documentado de Mercado Pago — es un resguardo
+// propio de tamaño de payload/UX.
+const MAX_ITEMS_CARRITO = 10;
 
-  if (!pedidoId || !email) {
-    return res.status(400).json({ error: 'pedidoId y email son obligatorios' });
+// Reparte un descuento entre varios ítems, proporcional al peso de cada
+// uno en el subtotal combinado. El ÚLTIMO ítem absorbe el resto exacto
+// (evita drift de redondeo: la suma siempre da subtotalImpTotal - descuento).
+// Cada precio queda como mínimo en 1 — Mercado Pago rechaza unit_price <= 0
+// (confirmado: "invalid_items · unit_price invalid").
+function distribuirDescuento(pedidos, descuentoTotal, subtotalImpTotal) {
+  if (descuentoTotal <= 0) return pedidos.map(p => p.subtotalImp);
+  let acumulado = 0;
+  return pedidos.map((p, i) => {
+    if (i === pedidos.length - 1) {
+      return Math.max(1, p.subtotalImp - (descuentoTotal - acumulado));
+    }
+    const share = Math.round(descuentoTotal * (p.subtotalImp / subtotalImpTotal));
+    acumulado += share;
+    return Math.max(1, p.subtotalImp - share);
+  });
+}
+
+app.post('/checkout', async (req, res) => {
+  const { pedidoGrupoId, pedidos, zona, direccion, costoEnvio, email, whatsapp, codigo } = req.body;
+
+  if (!pedidoGrupoId || !email) {
+    return res.status(400).json({ error: 'pedidoGrupoId y email son obligatorios' });
   }
-  // total = post-descuento; totalSinDescuento = pre-descuento (para verificación server-side)
-  const totalBase = typeof totalSinDescuento === 'number' ? totalSinDescuento : total;
-  if (typeof totalBase !== 'number' || totalBase <= 0) {
-    return res.status(400).json({ error: 'total inválido' });
+  if (!Array.isArray(pedidos) || pedidos.length === 0) {
+    return res.status(400).json({ error: 'El carrito no tiene ningún pedido' });
   }
+  if (pedidos.length > MAX_ITEMS_CARRITO) {
+    return res.status(400).json({ error: `Un mismo pago admite hasta ${MAX_ITEMS_CARRITO} pedidos` });
+  }
+  for (const p of pedidos) {
+    if (!p.pedidoId || typeof p.subtotalImp !== 'number' || p.subtotalImp <= 0) {
+      return res.status(400).json({ error: 'Uno de los pedidos del carrito es inválido' });
+    }
+  }
+  const envio = typeof costoEnvio === 'number' && costoEnvio >= 0 ? costoEnvio : 0;
+  const subtotalImpTotal = pedidos.reduce((acc, p) => acc + p.subtotalImp, 0);
+  const totalBase = subtotalImpTotal + envio;
 
   // ── Código promocional: validar y calcular descuento SERVER-SIDE ─────────
-  // Nunca se confía en el total/descuento que manda el cliente.
+  // Nunca se confía en ningún total/descuento que mande el cliente. El
+  // descuento se aplica UNA sola vez sobre el subtotal de impresión
+  // COMBINADO de todos los ítems del carrito (nunca sobre el envío, y
+  // nunca por ítem individual).
   let descuentoServer = 0;
   let userId = null;
 
   if (codigo) {
-    // Verificar JWT para identificar al usuario autenticado
     const authHeader = req.headers['authorization'] || '';
     const token = authHeader.replace('Bearer ', '').trim();
     if (!token) return res.status(401).json({ error: 'Se requiere sesión para usar un código' });
@@ -315,7 +344,6 @@ app.post('/checkout', async (req, res) => {
     if (authErr || !user) return res.status(401).json({ error: 'Sesión inválida' });
     userId = user.id;
 
-    // Buscar el código en la DB (service_role bypasea RLS)
     const { data: codigoData, error: codigoErr } = await supabase
       .from('codigos_promocionales')
       .select('tipo, valor')
@@ -327,19 +355,18 @@ app.post('/checkout', async (req, res) => {
       return res.status(400).json({ error: 'Código inválido o inactivo' });
     }
 
-    // Recalcular descuento server-side sobre impresión solamente (no envío)
-    const baseDescuento = typeof subtotalImp === 'number' ? subtotalImp : totalBase;
     if (codigoData.tipo === 'porcentaje') {
-      descuentoServer = Math.round(baseDescuento * codigoData.valor / 100);
+      descuentoServer = Math.round(subtotalImpTotal * codigoData.valor / 100);
     } else {
-      descuentoServer = Math.min(Number(codigoData.valor), baseDescuento);
+      descuentoServer = Math.min(Number(codigoData.valor), subtotalImpTotal);
     }
 
-    // Registrar uso ANTES de crear la preferencia MP.
+    // Registrar uso ANTES de crear la preferencia MP, UNA sola vez para
+    // todo el carrito (pedido_id = pedidoGrupoId, no un ítem individual).
     // Si la restricción UNIQUE (user_id, codigo) falla → código ya usado → rechazar.
     const { error: usoErr } = await supabase
       .from('codigos_usados')
-      .insert({ user_id: userId, codigo, pedido_id: pedidoId });
+      .insert({ user_id: userId, codigo, pedido_id: pedidoGrupoId });
 
     if (usoErr) {
       const yaUsado = usoErr.code === '23505'; // unique_violation
@@ -352,24 +379,33 @@ app.post('/checkout', async (req, res) => {
   }
 
   const totalParaPago = Math.max(0, totalBase - descuentoServer);
+  const preciosConDescuento = distribuirDescuento(pedidos, descuentoServer, subtotalImpTotal);
 
   const baseUrl = process.env.APP_BASE_URL;
-  console.log(`📦 Creando preferencia MP | pedidoId=${pedidoId} | total=${totalParaPago}`);
+  console.log(`📦 Creando preferencia MP | pedidoGrupoId=${pedidoGrupoId} | ${pedidos.length} ítem(s) | total=${totalParaPago}`);
 
-  // Crear preferencia en Mercado Pago
+  // Crear preferencia en Mercado Pago — un item por cada pedido del carrito
+  // (MP soporta items[] múltiples nativamente) + uno de envío si corresponde.
   let mpPreference;
   try {
+    const mpItems = pedidos.map((p, i) => ({
+      id:          p.pedidoId,
+      title:       pedidos.length > 1 ? `Impresión ${i + 1}/${pedidos.length} — Punto Color` : 'Impresión en Punto Color',
+      description: `${p.hojas ?? '?'} hoja(s) · ${p.config?.tinta ?? ''} · ${p.config?.acabado ?? ''}`,
+      quantity:    1,
+      unit_price:  preciosConDescuento[i],
+      currency_id: 'ARS',
+    }));
+    if (envio > 0) {
+      mpItems.push({
+        id: 'envio', title: 'Envío', quantity: 1, unit_price: envio, currency_id: 'ARS',
+      });
+    }
+
     mpPreference = await preferenceClient.create({
       body: {
-        external_reference: pedidoId,
-        items: [{
-          id:          pedidoId,
-          title:       'Impresión en Punto Color',
-          description: `${hojas ?? '?'} hoja(s) · ${config?.tinta ?? ''} · ${config?.acabado ?? ''}`,
-          quantity:    1,
-          unit_price:  totalParaPago,
-          currency_id: 'ARS',
-        }],
+        external_reference: pedidoGrupoId,
+        items: mpItems,
         payer: { email },
         back_urls: {
           success: `${baseUrl}/pago/success`,
@@ -386,31 +422,35 @@ app.post('/checkout', async (req, res) => {
     return res.status(502).json({ error: 'No se pudo crear la preferencia de pago' });
   }
 
-  // Guardar pedido en Supabase
-  const { error: dbError } = await supabase
-    .from('pedidos')
-    .insert({
-      pedido_id:        pedidoId,
-      estado:           'pendiente',
-      mp_preference_id: mpPreference.id,
-      total:            totalParaPago,
-      subtotal_imp:     subtotalImp    ?? null,
-      subtotal_env:     subtotalEnv    ?? null,
-      copies:           copies         ?? null,
-      pages:            pages          ?? null,
-      hojas:            hojas          ?? null,
-      precio_por_hoja:  precioPorHoja  ?? null,
-      acab_price:       acabPrice      ?? null,
-      caras_impresas:   carasImpresas  ?? null,
-      zona:             zona           ?? null,
-      config:           config         ?? null,
-      direccion:        direccion      ?? null,
-      archivos:         archivos       ?? null,
-      email,
-      whatsapp:         whatsapp       ?? null,
-      codigo_promo:     codigo         ?? null,
-      descuento:        descuentoServer > 0 ? descuentoServer : null,
-    });
+  // Guardar los pedidos en Supabase — una fila por ítem del carrito, todas
+  // compartiendo pedido_grupo_id. UN SOLO insert con el array completo:
+  // es una única sentencia SQL (INSERT ... VALUES (...),(...),(...)),
+  // atómica de por sí — si una fila falla, no se inserta ninguna.
+  const filas = pedidos.map(p => ({
+    pedido_id:        p.pedidoId,
+    pedido_grupo_id:  pedidoGrupoId,
+    estado:           'pendiente',
+    mp_preference_id: mpPreference.id,
+    total:            totalParaPago,   // total del GRUPO, repetido en cada fila
+    descuento:        descuentoServer > 0 ? descuentoServer : null, // ídem
+    subtotal_imp:     p.subtotalImp,
+    subtotal_env:     envio,           // ídem — el envío es único para todo el grupo
+    copies:           p.copies         ?? null,
+    pages:            p.pages          ?? null,
+    hojas:            p.hojas          ?? null,
+    precio_por_hoja:  p.precioPorHoja  ?? null,
+    acab_price:       p.acabPrice      ?? null,
+    caras_impresas:   p.carasImpresas  ?? null,
+    zona:             zona             ?? null,
+    config:           p.config         ?? null,
+    direccion:        direccion        ?? null,
+    archivos:         p.archivos       ?? null,
+    email,
+    whatsapp:         whatsapp         ?? null,
+    codigo_promo:     codigo           ?? null,
+  }));
+
+  const { error: dbError } = await supabase.from('pedidos').insert(filas);
 
   if (dbError) {
     console.error('Supabase insert error:', dbError);
@@ -440,18 +480,25 @@ app.post('/webhook', async (req, res) => {
     console.log(`Webhook payment ${data.id}: status=${payment.status}, ref=${payment.external_reference}`);
 
     if (payment.status === 'approved') {
+      const ref = payment.external_reference || '';
+      // pedidoGrupoId siempre empieza con 'PG-' (ver /checkout) — cualquier
+      // otro valor es un pedido_id suelto (formato viejo, 'PC-', de antes
+      // del carrito). Chequeo excluyente por prefijo, no un OR genérico:
+      // evita cualquier ambigüedad si algún día un pedido_id y un
+      // pedido_grupo_id llegaran a coincidir como string.
+      const matchColumn = ref.startsWith('PG-') ? 'pedido_grupo_id' : 'pedido_id';
       const { error } = await supabase
         .from('pedidos')
         .update({
           estado:         'pagado',
           mp_payment_id:  String(data.id),
         })
-        .eq('pedido_id', payment.external_reference);
+        .eq(matchColumn, ref);
 
       if (error) {
         console.error('Webhook Supabase update error:', error);
       } else {
-        console.log(`✅ Pedido ${payment.external_reference} marcado como pagado`);
+        console.log(`✅ Pedido(s) con ${matchColumn}=${ref} marcado(s) como pagado`);
       }
     }
   } catch (err) {
