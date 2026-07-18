@@ -457,11 +457,9 @@ app.post('/checkout', async (req, res) => {
     return res.status(500).json({ error: 'Pedido creado en MP pero no se pudo guardar en la base de datos' });
   }
 
-  // sandbox_init_point = checkout de prueba.
-  // Cuando pases a producción: cambiar a mpPreference.init_point
   return res.status(201).json({
     ok:          true,
-    checkoutUrl: mpPreference.sandbox_init_point,
+    checkoutUrl: mpPreference.init_point,
   });
 });
 
