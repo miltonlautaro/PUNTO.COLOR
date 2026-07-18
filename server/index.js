@@ -481,6 +481,15 @@ app.post('/webhook', async (req, res) => {
   // en Railway, se omite (con warning) para no romper el flujo actual;
   // en cuanto la variable exista, la validación se activa sola.
   if (process.env.MP_WEBHOOK_SECRET) {
+    // TEMPORAL — diagnóstico de un SignatureMismatch. No incluye el
+    // secreto ni el hash calculado, solo lo que llega en la request.
+    console.log('🔍 Webhook debug:', {
+      xSignature: req.headers['x-signature'],
+      xRequestId: req.headers['x-request-id'],
+      queryDataId: req.query['data.id'],
+      bodyDataId: data?.id,
+      fullQuery: req.query,
+    });
     try {
       WebhookSignatureValidator.validate({
         xSignature: req.headers['x-signature'],
