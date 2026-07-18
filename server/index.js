@@ -12,6 +12,7 @@ import { mkdtempSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import PQueue from 'p-queue';
+import { rateLimit } from 'express-rate-limit';
 
 const execAsync = promisify(exec);
 // soffice en PATH en Linux/Docker; en Windows ajustar si es necesario
@@ -44,9 +45,27 @@ const upload = multer({
 
 const app = express();
 app.use(express.json());
-// origin: '*' es suficiente para desarrollo local (archivo HTML abierto con file://)
-// En producción reemplazar con el dominio real del sitio
-app.use(cors({ origin: '*' }));
+// Solo los orígenes reales del sitio — antes era '*' (cualquier origen),
+// válido en desarrollo pero no en producción con plata real de por medio.
+app.use(cors({
+  origin: [
+    'https://www.puntocolorimpresiones.com',
+    'https://puntocolorimpresiones.com',
+    'https://puntocolor.netlify.app',
+  ],
+}));
+
+// Rate limit para /procesar-archivo: no requiere login (el sitio permite
+// compra como invitado, ver /checkout más abajo), así que en vez de exigir
+// JWT ahí — lo que rompería esa compra sin cuenta — se limita por IP para
+// frenar abuso/spam sin afectar a un cliente real subiendo sus archivos.
+const procesarArchivoLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Demasiados archivos procesados en poco tiempo. Esperá unos minutos e intentá de nuevo.' },
+});
 
 // service_role bypasea RLS — nunca expongas esta key al cliente
 const supabase = createClient(
@@ -77,7 +96,7 @@ function sanitizeKey(name) {
     .replace(/^_|_$/g, '');            // trim
 }
 
-app.post('/procesar-archivo', (req, res) => {
+app.post('/procesar-archivo', procesarArchivoLimiter, (req, res) => {
   upload.single('archivo')(req, res, async (err) => {
     if (err) {
       const msg = err.code === 'LIMIT_FILE_SIZE'
@@ -151,7 +170,7 @@ async function procesarArchivoHandler(req, res) {
 }
 
 // ── Borrar archivo de Storage (llamado desde removeFile() — fire-and-forget) ──
-app.delete('/procesar-archivo', async (req, res) => {
+app.delete('/procesar-archivo', procesarArchivoLimiter, async (req, res) => {
   const { path: storagePath } = req.body;
   if (!storagePath) return res.status(400).json({ error: 'path requerido' });
   const { error } = await supabase.storage.from(BUCKET).remove([storagePath]);
