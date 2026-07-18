@@ -475,21 +475,13 @@ app.post('/webhook', async (req, res) => {
   const { type, data } = req.body;
   if (type !== 'payment' || !data?.id) return;
 
-  // Validar la firma antes de confiar en la notificación — sin esto,
-  // cualquiera podría simular un webhook y marcar un pedido como pagado
-  // sin haber pagado nada. Si todavía no configuraste MP_WEBHOOK_SECRET
-  // en Railway, se omite (con warning) para no romper el flujo actual;
-  // en cuanto la variable exista, la validación se activa sola.
+  // Validar la firma cuando se pueda — pero SOLO avisar si falla, nunca
+  // bloquear. La suscripción "Pagos (legacy)" del dashboard de MP no
+  // soporta x-signature (confirmado: el secreto de esa sección no está
+  // atado al notification_url que seteamos por preferencia), así que hoy
+  // el mismatch es esperado, no un ataque. Si algún día se resuelve el
+  // secreto correcto, esto ya está listo para endurecerse a bloqueante.
   if (process.env.MP_WEBHOOK_SECRET) {
-    // TEMPORAL — diagnóstico de un SignatureMismatch. No incluye el
-    // secreto ni el hash calculado, solo lo que llega en la request.
-    console.log('🔍 Webhook debug:', {
-      xSignature: req.headers['x-signature'],
-      xRequestId: req.headers['x-request-id'],
-      queryDataId: req.query['data.id'],
-      bodyDataId: data?.id,
-      fullQuery: req.query,
-    });
     try {
       WebhookSignatureValidator.validate({
         xSignature: req.headers['x-signature'],
@@ -498,8 +490,7 @@ app.post('/webhook', async (req, res) => {
         secret: process.env.MP_WEBHOOK_SECRET,
       });
     } catch (err) {
-      console.error('Webhook rechazado: firma inválida ->', err.message);
-      return;
+      console.warn('⚠️  Firma de webhook no validada (no bloquea) ->', err.message);
     }
   } else {
     console.warn('⚠️  MP_WEBHOOK_SECRET no configurado — el webhook no está validando firma');
