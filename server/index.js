@@ -13,6 +13,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import PQueue from 'p-queue';
 import { rateLimit } from 'express-rate-limit';
+import { Resend } from 'resend';
 
 const execAsync = promisify(exec);
 // soffice en PATH en Linux/Docker; en Windows ajustar si es necesario
@@ -79,6 +80,8 @@ const mpClient = new MercadoPagoConfig({
 });
 const preferenceClient = new Preference(mpClient);
 const paymentClient = new Payment(mpClient);
+
+const resend = new Resend(process.env.RESEND_API_KEY);
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
@@ -482,6 +485,97 @@ app.post('/checkout', async (req, res) => {
   });
 });
 
+// ── Email de confirmación de pedido (Resend) ─────────────────────────────────
+// Se dispara SOLO cuando el webhook confirma un pago (nunca antes) — ver
+// el update con .neq('estado','pagado') más abajo, que evita reenviarlo
+// en reintentos del webhook para un pedido que ya estaba pagado.
+function construirEmailConfirmacion(filas) {
+  const primera = filas[0];
+  const pedidoRef = primera.pedido_grupo_id || primera.pedido_id;
+
+  const itemsHtml = filas.map((f, i) => {
+    const archivos = (f.archivos || []).join(', ') || 'Archivo';
+    const specs = [f.config?.tinta, f.config?.cara, f.config?.acabado].filter(Boolean).join(' · ');
+    const prefijo = filas.length > 1 ? `Pedido ${i + 1}: ` : '';
+    return `
+      <tr>
+        <td style="padding:10px 0;border-bottom:1px solid #e8d9b8;color:#1a1009;font-size:14px;">
+          <strong>${escapeHtml(prefijo)}</strong>${escapeHtml(archivos)}<br>
+          <span style="color:#6b5200;font-size:13px;">${escapeHtml(specs)}</span>
+        </td>
+      </tr>`;
+  }).join('');
+
+  const html = `
+    <!DOCTYPE html>
+    <html lang="es">
+    <body style="margin:0;padding:0;background:#f5e8d0;font-family:Arial,Helvetica,sans-serif;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f5e8d0;padding:24px 0;">
+        <tr><td align="center">
+          <table role="presentation" width="480" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:16px;overflow:hidden;">
+            <tr>
+              <td style="background:#1a1009;padding:20px 24px;text-align:center;">
+                <span style="font-size:20px;font-weight:bold;color:#f5e8cf;">Punto <span style="color:#ff8a75;">Color</span></span>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:28px 24px;">
+                <div style="font-size:40px;text-align:center;margin-bottom:8px;">✅</div>
+                <h1 style="font-size:20px;color:#2ec4b6;text-align:center;margin:0 0 12px;">¡Pago confirmado!</h1>
+                <p style="font-size:14px;color:#1a1009;line-height:1.5;text-align:center;margin:0 0 20px;">
+                  Recibimos tu pago y ya estamos preparando tu pedido.
+                </p>
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:16px;">
+                  ${itemsHtml}
+                </table>
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f5e8d0;border-radius:12px;">
+                  <tr>
+                    <td style="padding:14px 16px;font-size:14px;color:#4a2e0a;">
+                      Referencia: <strong>${escapeHtml(pedidoRef)}</strong><br>
+                      Total pagado: <strong>$ ${Number(primera.total).toLocaleString('es-AR')}</strong>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:16px 24px;text-align:center;background:#f5e8d0;font-size:12px;color:#6b5200;">
+                Punto Color · Paraná, Entre Ríos
+              </td>
+            </tr>
+          </table>
+        </td></tr>
+      </table>
+    </body>
+    </html>
+  `;
+
+  const subject = filas.length > 1
+    ? `Confirmamos tu pago — ${filas.length} pedidos en Punto Color`
+    : 'Confirmamos tu pago en Punto Color';
+
+  return { subject, html };
+}
+
+async function enviarEmailConfirmacion(filas) {
+  const email = filas[0]?.email;
+  if (!email) return;
+  try {
+    const { subject, html } = construirEmailConfirmacion(filas);
+    await resend.emails.send({
+      from: 'Punto Color <pedidos@puntocolorimpresiones.com>',
+      to: email,
+      subject,
+      html,
+    });
+    console.log(`📧 Email de confirmación enviado a ${email}`);
+  } catch (err) {
+    // Un fallo acá NUNCA debe afectar el resto del webhook — el pedido
+    // ya quedó marcado 'pagado' independientemente de si el email salió.
+    console.error('Error enviando email de confirmación:', err);
+  }
+}
+
 // ── Webhook de Mercado Pago ───────────────────────────────────────────────────
 // MP llama acá cada vez que un pago cambia de estado. Puede llamar varias
 // veces para el mismo pago (reintentos) — el handler es idempotente.
@@ -525,18 +619,27 @@ app.post('/webhook', async (req, res) => {
       // evita cualquier ambigüedad si algún día un pedido_id y un
       // pedido_grupo_id llegaran a coincidir como string.
       const matchColumn = ref.startsWith('PG-') ? 'pedido_grupo_id' : 'pedido_id';
-      const { error } = await supabase
+      // .neq('estado','pagado') + .select(): solo trae las filas que
+      // ESTA llamada realmente hizo pasar a 'pagado'. Si MP reintenta el
+      // webhook para un pago ya confirmado antes, no vuelve ninguna fila
+      // acá — así el email de confirmación nunca se manda dos veces.
+      const { data: filasActualizadas, error } = await supabase
         .from('pedidos')
         .update({
           estado:         'pagado',
           mp_payment_id:  String(data.id),
         })
-        .eq(matchColumn, ref);
+        .eq(matchColumn, ref)
+        .neq('estado', 'pagado')
+        .select();
 
       if (error) {
         console.error('Webhook Supabase update error:', error);
       } else {
         console.log(`✅ Pedido(s) con ${matchColumn}=${ref} marcado(s) como pagado`);
+        if (filasActualizadas && filasActualizadas.length > 0) {
+          await enviarEmailConfirmacion(filasActualizadas);
+        }
       }
     }
   } catch (err) {
