@@ -2,7 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
-import { MercadoPagoConfig, Preference, Payment } from 'mercadopago';
+import { MercadoPagoConfig, Preference, Payment, WebhookSignatureValidator } from 'mercadopago';
 import multer from 'multer';
 import { PDFDocument } from 'pdf-lib';
 import { exec } from 'child_process';
@@ -474,6 +474,27 @@ app.post('/webhook', async (req, res) => {
 
   const { type, data } = req.body;
   if (type !== 'payment' || !data?.id) return;
+
+  // Validar la firma antes de confiar en la notificación — sin esto,
+  // cualquiera podría simular un webhook y marcar un pedido como pagado
+  // sin haber pagado nada. Si todavía no configuraste MP_WEBHOOK_SECRET
+  // en Railway, se omite (con warning) para no romper el flujo actual;
+  // en cuanto la variable exista, la validación se activa sola.
+  if (process.env.MP_WEBHOOK_SECRET) {
+    try {
+      WebhookSignatureValidator.validate({
+        xSignature: req.headers['x-signature'],
+        xRequestId: req.headers['x-request-id'],
+        dataId: req.query['data.id'],
+        secret: process.env.MP_WEBHOOK_SECRET,
+      });
+    } catch (err) {
+      console.error('Webhook rechazado: firma inválida ->', err.message);
+      return;
+    }
+  } else {
+    console.warn('⚠️  MP_WEBHOOK_SECRET no configurado — el webhook no está validando firma');
+  }
 
   try {
     const payment = await paymentClient.get({ id: data.id });
