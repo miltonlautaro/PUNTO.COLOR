@@ -81,7 +81,10 @@ const mpClient = new MercadoPagoConfig({
 const preferenceClient = new Preference(mpClient);
 const paymentClient = new Payment(mpClient);
 
-const resend = new Resend(process.env.RESEND_API_KEY);
+// El constructor de Resend tira una excepción SINCRÓNICA si falta la key —
+// eso frenaba el arranque de TODO el servidor, no solo el email. Nunca
+// debe construirse sin la key presente.
+const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/health', (_req, res) => res.json({ ok: true }));
@@ -560,6 +563,10 @@ function construirEmailConfirmacion(filas) {
 async function enviarEmailConfirmacion(filas) {
   const email = filas[0]?.email;
   if (!email) return;
+  if (!resend) {
+    console.warn('⚠️  RESEND_API_KEY no configurado — no se envía email de confirmación');
+    return;
+  }
   try {
     const { subject, html } = construirEmailConfirmacion(filas);
     await resend.emails.send({
