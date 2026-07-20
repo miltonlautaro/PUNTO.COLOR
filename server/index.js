@@ -45,6 +45,11 @@ const upload = multer({
 });
 
 const app = express();
+// Railway pone su proxy de borde delante de la app: confiar exactamente
+// 1 salto (no 'true', que confiaría en cualquier cantidad y permitiría
+// falsificar X-Forwarded-For) — necesario para que express-rate-limit
+// identifique la IP real del cliente en vez de tirar un error.
+app.set('trust proxy', 1);
 app.use(express.json());
 // Solo los orígenes reales del sitio — antes era '*' (cualquier origen),
 // válido en desarrollo pero no en producción con plata real de por medio.
