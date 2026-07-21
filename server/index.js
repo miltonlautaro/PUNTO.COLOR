@@ -14,6 +14,7 @@ import { tmpdir } from 'os';
 import PQueue from 'p-queue';
 import { rateLimit } from 'express-rate-limit';
 import { Resend } from 'resend';
+import { randomUUID, randomBytes, createHmac, timingSafeEqual } from 'crypto';
 
 const execAsync = promisify(exec);
 // soffice en PATH en Linux/Docker; en Windows ajustar si es necesario
@@ -39,7 +40,18 @@ const upload = multer({
         cb(null, dir);
       } catch (err) { cb(err); }
     },
-    filename(req, file, cb) { cb(null, file.originalname); },
+    // NUNCA usar file.originalname para el nombre en disco: lo controla
+    // 100% quien sube el archivo (viene del multipart) y, sin sanitizar,
+    // permite path traversal vía secuencias '../' — multer no lo hace
+    // por su cuenta. El nombre original se sigue usando más abajo solo
+    // para lo que ve el cliente (Storage, respuesta), nunca para la
+    // ruta real en disco.
+    filename(req, file, cb) {
+      const ext = (file.originalname.split('.').pop() || 'bin')
+        .replace(/[^a-zA-Z0-9]/g, '')
+        .slice(0, 10);
+      cb(null, `${randomUUID()}.${ext}`);
+    },
   }),
   limits: { fileSize: 300 * 1024 * 1024 },
 });
@@ -98,6 +110,31 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 const IMAGENES = ['jpg','jpeg','png','webp','gif','bmp','tiff'];
 const BUCKET   = 'archivos-pedidos';
 
+// Firma para poder borrar un archivo de Storage sin exigir login (el
+// checkout admite compra como invitado). Sin esto, DELETE /procesar-archivo
+// aceptaba cualquier path y borraba archivos de CUALQUIER pedido — quien
+// suba un archivo recibe un token firmado junto con el storageUrl, y solo
+// ese token (no adivinable) autoriza borrar ESE archivo puntual.
+// Fallback: si falta la variable de entorno, se genera una al arrancar —
+// los tokens dejan de ser válidos si el proceso reinicia, pero el borrado
+// ya es fire-and-forget del lado del cliente (removeFile()), así que un
+// archivo que no se pudo borrar por esto queda cubierto igual por la
+// limpieza de huérfanos.
+const FILE_DELETE_SECRET = process.env.FILE_DELETE_SECRET || randomBytes(32).toString('hex');
+if (!process.env.FILE_DELETE_SECRET) {
+  console.warn('⚠️  FILE_DELETE_SECRET no configurado — usando uno generado en este arranque');
+}
+function firmarStoragePath(path) {
+  return createHmac('sha256', FILE_DELETE_SECRET).update(path).digest('hex');
+}
+function tokenValido(path, tokenRecibido) {
+  if (!tokenRecibido) return false;
+  const esperado = firmarStoragePath(path);
+  const a = Buffer.from(esperado);
+  const b = Buffer.from(String(tokenRecibido));
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 function sanitizeKey(name) {
   return name
     .normalize('NFD')
@@ -121,7 +158,7 @@ app.post('/procesar-archivo', procesarArchivoLimiter, (req, res) => {
 
 async function procesarArchivoHandler(req, res) {
   if (!req.file) return res.status(400).json({ error: 'No se recibió ningún archivo' });
-  const { originalname, path: inputPath } = req.file;
+  const { originalname, path: inputPath, filename: safeDiskName } = req.file;
   const pedidoId = req.body.pedidoId;
   if (!pedidoId) return res.status(400).json({ error: 'pedidoId requerido' });
 
@@ -141,8 +178,11 @@ async function procesarArchivoHandler(req, res) {
     } else {
       // docx, xlsx, pptx, imágenes → LibreOffice convierte a PDF via cola de conversión.
       // La cola garantiza que un fallo o timeout no bloquea las siguientes conversiones.
-      convertedName = originalname.replace(/\.[^.]+$/, '.pdf');
-      const outPath = join(tmpDir, convertedName);
+      convertedName = originalname.replace(/\.[^.]+$/, '.pdf'); // nombre para mostrar / Storage
+      // LibreOffice nombra la salida según el archivo de ENTRADA real en
+      // disco (safeDiskName, el nombre random generado en diskStorage),
+      // no según el nombre original — outPath tiene que seguir a ese.
+      const outPath = join(tmpDir, safeDiskName.replace(/\.[^.]+$/, '.pdf'));
       await conversionQueue.add(async () => {
         const loProfile = join(tmpDir, 'lo-profile').replace(/\\/g, '/');
         // timeout en execAsync mata el proceso soffice hijo con SIGKILL si se agota
@@ -168,7 +208,10 @@ async function procesarArchivoHandler(req, res) {
       return res.status(500).json({ error: 'No se pudo guardar el archivo' });
     }
 
-    const response = { ok: true, pages, storageUrl: storagePath, convertedName };
+    const response = {
+      ok: true, pages, storageUrl: storagePath, convertedName,
+      deleteToken: firmarStoragePath(storagePath),
+    };
     if (pdfBase64) response.pdfBase64 = pdfBase64;
     return res.json(response);
 
@@ -182,8 +225,11 @@ async function procesarArchivoHandler(req, res) {
 
 // ── Borrar archivo de Storage (llamado desde removeFile() — fire-and-forget) ──
 app.delete('/procesar-archivo', procesarArchivoLimiter, async (req, res) => {
-  const { path: storagePath } = req.body;
+  const { path: storagePath, deleteToken } = req.body;
   if (!storagePath) return res.status(400).json({ error: 'path requerido' });
+  if (!tokenValido(storagePath, deleteToken)) {
+    return res.status(403).json({ error: 'No autorizado a borrar este archivo' });
+  }
   const { error } = await supabase.storage.from(BUCKET).remove([storagePath]);
   if (error) return res.status(500).json({ error: error.message });
   return res.json({ ok: true });
@@ -228,13 +274,18 @@ app.post('/admin/limpiar-huerfanos', async (req, res) => {
       try {
         const { data: pedido, error: pedidoErr } = await supabase
           .from('pedidos')
-          .select('estado, created_at')
+          .select('estado, created_at, mp_status')
           .eq('pedido_id', pedidoId)
           .maybeSingle();
         if (pedidoErr) throw pedidoErr;
 
-        const esHuerfano = !pedido
-          || (pedido.estado === 'pendiente' && (Date.now() - new Date(pedido.created_at).getTime()) > ORPHAN_MAX_AGE_MS);
+        // pending/in_process (Rapipago, Pago Fácil) pueden tardar días en
+        // confirmarse — nunca se consideran huérfanos aunque tengan más
+        // de 48hs, para no borrar los archivos de un pago que todavía
+        // puede llegar a confirmarse.
+        const pagoEnCurso = pedido?.mp_status === 'pending' || pedido?.mp_status === 'in_process';
+        const esHuerfano = !pagoEnCurso && (!pedido
+          || (pedido.estado === 'pendiente' && (Date.now() - new Date(pedido.created_at).getTime()) > ORPHAN_MAX_AGE_MS));
         if (!esHuerfano) continue;
 
         const archivos = await listAllStorage(pedidoId);
@@ -456,6 +507,13 @@ app.post('/checkout', async (req, res) => {
   // compartiendo pedido_grupo_id. UN SOLO insert con el array completo:
   // es una única sentencia SQL (INSERT ... VALUES (...),(...),(...)),
   // atómica de por sí — si una fila falla, no se inserta ninguna.
+  //
+  // La preferencia de Mercado Pago YA existe en este punto — si el
+  // insert falla y no se hace nada más, el cliente puede pagar esa
+  // preferencia igual y quedar sin ningún registro en Punto Color
+  // ("pedido fantasma"). Por eso: reintentar unas veces (cubre fallos
+  // momentáneos de Supabase) y, si definitivamente falla, avisar por
+  // email con los datos necesarios para conciliar a mano.
   const filas = pedidos.map(p => ({
     pedido_id:        p.pedidoId,
     pedido_grupo_id:  pedidoGrupoId,
@@ -480,10 +538,13 @@ app.post('/checkout', async (req, res) => {
     codigo_promo:     codigo           ?? null,
   }));
 
-  const { error: dbError } = await supabase.from('pedidos').insert(filas);
+  const { ok: insertOk, error: dbError } = await insertarPedidosConReintento(filas);
 
-  if (dbError) {
-    console.error('Supabase insert error:', dbError);
+  if (!insertOk) {
+    console.error('Supabase insert error (definitivo tras reintentos):', dbError);
+    await alertarPedidoFantasma({
+      pedidoGrupoId, mpPreferenceId: mpPreference.id, email, total: totalParaPago, dbError,
+    });
     return res.status(500).json({ error: 'Pedido creado en MP pero no se pudo guardar en la base de datos' });
   }
 
@@ -588,6 +649,54 @@ async function enviarEmailConfirmacion(filas) {
   }
 }
 
+// ── "Pedido fantasma": preferencia de MP creada pero insert a Supabase falló ──
+// Reintenta el insert unas pocas veces (cubre caídas momentáneas) antes de
+// darse por vencido y avisar por email con lo necesario para conciliar a mano.
+async function insertarPedidosConReintento(filas, intentos = 3) {
+  let ultimoError = null;
+  for (let i = 0; i < intentos; i++) {
+    const { error } = await supabase.from('pedidos').insert(filas);
+    if (!error) return { ok: true };
+    ultimoError = error;
+    console.error(`Supabase insert error (intento ${i + 1}/${intentos}):`, error);
+    if (i < intentos - 1) await new Promise(r => setTimeout(r, 500 * (i + 1)));
+  }
+  return { ok: false, error: ultimoError };
+}
+
+async function alertarPedidoFantasma({ pedidoGrupoId, mpPreferenceId, email, total, dbError }) {
+  const detalle = {
+    pedidoGrupoId, mpPreferenceId, email, total,
+    error: dbError?.message || String(dbError),
+  };
+  if (!resend) {
+    console.error('🚨 PEDIDO FANTASMA (sin alerta por email, RESEND_API_KEY no configurado):', detalle);
+    return;
+  }
+  const destino = process.env.ADMIN_ALERT_EMAIL || 'miltonlautaro@gmail.com';
+  try {
+    await resend.emails.send({
+      from: 'Punto Color <pedidos@puntocolorimpresiones.com>',
+      to: destino,
+      subject: '🚨 Pedido fantasma — revisar a mano',
+      html: `
+        <p><strong>Un cliente puede llegar a pagar sin que quede registro en la base de Punto Color.</strong></p>
+        <p>
+          pedidoGrupoId: ${escapeHtml(pedidoGrupoId)}<br>
+          Preferencia de Mercado Pago: ${escapeHtml(mpPreferenceId)}<br>
+          Email del cliente: ${escapeHtml(email)}<br>
+          Total: $ ${Number(total).toLocaleString('es-AR')}
+        </p>
+        <p>Buscá esta preferencia en tu panel de Mercado Pago para confirmar si el cliente pagó, y cargá el pedido a mano en Supabase si corresponde.</p>
+        <p style="color:#888;font-size:12px">Error técnico: ${escapeHtml(dbError?.message || 'desconocido')}</p>
+      `,
+    });
+    console.log('🚨 Alerta de pedido fantasma enviada a', destino);
+  } catch (err) {
+    console.error('No se pudo enviar el email de alerta de pedido fantasma:', err, detalle);
+  }
+}
+
 // ── Webhook de Mercado Pago ───────────────────────────────────────────────────
 // MP llama acá cada vez que un pago cambia de estado. Puede llamar varias
 // veces para el mismo pago (reintentos) — el handler es idempotente.
@@ -623,14 +732,15 @@ app.post('/webhook', async (req, res) => {
     const payment = await paymentClient.get({ id: data.id });
     console.log(`Webhook payment ${data.id}: status=${payment.status}, ref=${payment.external_reference}`);
 
+    const ref = payment.external_reference || '';
+    // pedidoGrupoId siempre empieza con 'PG-' (ver /checkout) — cualquier
+    // otro valor es un pedido_id suelto (formato viejo, 'PC-', de antes
+    // del carrito). Chequeo excluyente por prefijo, no un OR genérico:
+    // evita cualquier ambigüedad si algún día un pedido_id y un
+    // pedido_grupo_id llegaran a coincidir como string.
+    const matchColumn = ref.startsWith('PG-') ? 'pedido_grupo_id' : 'pedido_id';
+
     if (payment.status === 'approved') {
-      const ref = payment.external_reference || '';
-      // pedidoGrupoId siempre empieza con 'PG-' (ver /checkout) — cualquier
-      // otro valor es un pedido_id suelto (formato viejo, 'PC-', de antes
-      // del carrito). Chequeo excluyente por prefijo, no un OR genérico:
-      // evita cualquier ambigüedad si algún día un pedido_id y un
-      // pedido_grupo_id llegaran a coincidir como string.
-      const matchColumn = ref.startsWith('PG-') ? 'pedido_grupo_id' : 'pedido_id';
       // .neq('estado','pagado') + .select(): solo trae las filas que
       // ESTA llamada realmente hizo pasar a 'pagado'. Si MP reintenta el
       // webhook para un pago ya confirmado antes, no vuelve ninguna fila
@@ -640,6 +750,7 @@ app.post('/webhook', async (req, res) => {
         .update({
           estado:         'pagado',
           mp_payment_id:  String(data.id),
+          mp_status:      payment.status,
         })
         .eq(matchColumn, ref)
         .neq('estado', 'pagado')
@@ -653,6 +764,20 @@ app.post('/webhook', async (req, res) => {
           await enviarEmailConfirmacion(filasActualizadas);
         }
       }
+    } else {
+      // pending / in_process (Rapipago, Pago Fácil pueden tardar días en
+      // confirmarse) / rejected / cancelled, etc. — nunca se toca 'estado'
+      // acá (solo la rama 'approved' lo hace), pero SÍ se registra el
+      // status real de MP en mp_status. Es la pieza clave para que la
+      // limpieza de huérfanos pueda excluir un pago en curso aunque
+      // tenga más de 48hs (ver /admin/limpiar-huerfanos).
+      const { error } = await supabase
+        .from('pedidos')
+        .update({ mp_status: payment.status })
+        .eq(matchColumn, ref);
+
+      if (error) console.error('Webhook Supabase update error (mp_status):', error);
+      else console.log(`Pedido(s) con ${matchColumn}=${ref} — status de MP: ${payment.status}`);
     }
   } catch (err) {
     console.error('Webhook error:', err);
