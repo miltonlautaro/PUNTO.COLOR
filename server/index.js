@@ -148,13 +148,31 @@ app.post('/procesar-archivo', procesarArchivoLimiter, (req, res) => {
   upload.single('archivo')(req, res, async (err) => {
     if (err) {
       const msg = err.code === 'LIMIT_FILE_SIZE'
-        ? 'El archivo es demasiado grande (máximo 150 MB)'
+        ? 'El archivo es demasiado grande (máximo 300 MB)'
         : (err.message || 'Error al recibir el archivo');
       return res.status(400).json({ error: msg });
     }
     return procesarArchivoHandler(req, res);
   });
 });
+
+// Envuelve PDFDocument.load con un mensaje claro para el cliente — sin
+// esto, un PDF dañado (o un .pdf que en realidad no es un PDF) devolvía
+// el mensaje técnico crudo de pdf-lib con un 500 genérico (probado: da
+// "Failed to parse PDF document (line:2 col:0 offset=46): No PDF header
+// found"). Es el único caso de "archivo con problema" que realmente falla
+// de forma confiable — LibreOffice, en cambio, es muy permisivo y convierte
+// casi cualquier cosa (probado con archivos vacíos, binarios random y
+// texto plano) en vez de tirar error.
+async function cargarPDFConMensajeClaro(buffer) {
+  try {
+    return await PDFDocument.load(buffer, { ignoreEncryption: true });
+  } catch (err) {
+    const claro = new Error('No pudimos leer tu PDF — puede estar dañado o no ser un PDF válido. Probá abrirlo en otro programa, guardalo de nuevo y subilo otra vez.');
+    claro.status = 400;
+    throw claro;
+  }
+}
 
 async function procesarArchivoHandler(req, res) {
   if (!req.file) return res.status(400).json({ error: 'No se recibió ningún archivo' });
@@ -173,7 +191,7 @@ async function procesarArchivoHandler(req, res) {
       // PDF: leer del disco para contar páginas y subir tal cual
       pdfBuffer     = await readFile(inputPath);
       convertedName = originalname;
-      const doc     = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
+      const doc     = await cargarPDFConMensajeClaro(pdfBuffer);
       pages         = doc.getPageCount();
     } else {
       // docx, xlsx, pptx, imágenes → LibreOffice convierte a PDF via cola de conversión.
@@ -192,7 +210,7 @@ async function procesarArchivoHandler(req, res) {
         );
       });
       pdfBuffer = await readFile(outPath);
-      const doc = await PDFDocument.load(pdfBuffer, { ignoreEncryption: true });
+      const doc = await cargarPDFConMensajeClaro(pdfBuffer);
       pages     = doc.getPageCount();
       // Devolver el PDF al cliente para la vista previa
       pdfBase64 = pdfBuffer.toString('base64');
@@ -217,7 +235,7 @@ async function procesarArchivoHandler(req, res) {
 
   } catch (err) {
     console.error('procesar-archivo error:', err);
-    return res.status(500).json({ error: err.message || 'Error al procesar el archivo' });
+    return res.status(err.status || 500).json({ error: err.message || 'Error al procesar el archivo' });
   } finally {
     rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
