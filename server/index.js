@@ -165,13 +165,24 @@ app.post('/procesar-archivo', procesarArchivoLimiter, (req, res) => {
 // casi cualquier cosa (probado con archivos vacíos, binarios random y
 // texto plano) en vez de tirar error.
 async function cargarPDFConMensajeClaro(buffer) {
+  let doc;
   try {
-    return await PDFDocument.load(buffer, { ignoreEncryption: true });
+    doc = await PDFDocument.load(buffer, { ignoreEncryption: true });
   } catch (err) {
     const claro = new Error('No pudimos leer tu PDF — puede estar dañado o no ser un PDF válido. Probá abrirlo en otro programa, guardalo de nuevo y subilo otra vez.');
     claro.status = 400;
     throw claro;
   }
+  // ignoreEncryption:true deja que pdf-lib parsee la ESTRUCTURA de un PDF
+  // cifrado (por eso no siempre falla arriba), pero el CONTENIDO puede
+  // quedar ilegible — el cliente pagaría por un archivo que en la
+  // impresora puede salir en blanco. Rechazarlo acá, explícitamente.
+  if (doc.isEncrypted) {
+    const err = new Error('Tu PDF tiene contraseña. Quitásela (en el mismo programa donde lo generaste, o con alguna herramienta para eso) y volvé a subirlo.');
+    err.status = 400;
+    throw err;
+  }
+  return doc;
 }
 
 async function procesarArchivoHandler(req, res) {
@@ -715,6 +726,52 @@ async function alertarPedidoFantasma({ pedidoGrupoId, mpPreferenceId, email, tot
   }
 }
 
+// ── Si falla la consulta del pago al webhook, reintentar y avisar ────────────
+// MP ya recibió el 200 antes de esto (para que no reintente el webhook por
+// timeout) — si paymentClient.get() falla y no se hace nada más, el pedido
+// nunca se marca 'pagado' aunque el pago haya sido aprobado, sin que nadie
+// se entere. Reintenta unas veces (cubre fallos momentáneos de red hacia la
+// API de MP) y, si sigue fallando, avisa por email con el id de pago para
+// poder resolverlo a mano.
+async function consultarPagoConReintento(paymentId, intentos = 3) {
+  let ultimoError = null;
+  for (let i = 0; i < intentos; i++) {
+    try {
+      return await paymentClient.get({ id: paymentId });
+    } catch (err) {
+      ultimoError = err;
+      console.error(`paymentClient.get error (intento ${i + 1}/${intentos}):`, err.message || err);
+      if (i < intentos - 1) await new Promise(r => setTimeout(r, 500 * (i + 1)));
+    }
+  }
+  throw ultimoError;
+}
+
+async function alertarWebhookSinResolver(paymentId, error) {
+  const detalle = { paymentId, error: error?.message || String(error) };
+  if (!resend) {
+    console.error('🚨 WEBHOOK sin resolver (sin alerta por email, RESEND_API_KEY no configurado):', detalle);
+    return;
+  }
+  const destino = process.env.ADMIN_ALERT_EMAIL || 'miltonlautaro@gmail.com';
+  try {
+    await resend.emails.send({
+      from: 'Punto Color <pedidos@puntocolorimpresiones.com>',
+      to: destino,
+      subject: '🚨 Webhook de Mercado Pago sin resolver',
+      html: `
+        <p><strong>No se pudo consultar el estado de un pago después de varios intentos — el pedido podría no haberse marcado como pagado aunque el cliente sí haya pagado.</strong></p>
+        <p>ID de pago en Mercado Pago: ${escapeHtml(paymentId)}</p>
+        <p>Revisá ese pago directamente en tu panel de Mercado Pago y, si corresponde, marcá el pedido como pagado a mano en Supabase.</p>
+        <p style="color:#888;font-size:12px">Error técnico: ${escapeHtml(error?.message || 'desconocido')}</p>
+      `,
+    });
+    console.log('🚨 Alerta de webhook sin resolver enviada a', destino);
+  } catch (err) {
+    console.error('No se pudo enviar el email de alerta de webhook sin resolver:', err, detalle);
+  }
+}
+
 // ── Webhook de Mercado Pago ───────────────────────────────────────────────────
 // MP llama acá cada vez que un pago cambia de estado. Puede llamar varias
 // veces para el mismo pago (reintentos) — el handler es idempotente.
@@ -747,7 +804,7 @@ app.post('/webhook', async (req, res) => {
   }
 
   try {
-    const payment = await paymentClient.get({ id: data.id });
+    const payment = await consultarPagoConReintento(data.id);
     console.log(`Webhook payment ${data.id}: status=${payment.status}, ref=${payment.external_reference}`);
 
     const ref = payment.external_reference || '';
@@ -798,7 +855,8 @@ app.post('/webhook', async (req, res) => {
       else console.log(`Pedido(s) con ${matchColumn}=${ref} — status de MP: ${payment.status}`);
     }
   } catch (err) {
-    console.error('Webhook error:', err);
+    console.error('Webhook error (tras reintentos):', err);
+    await alertarWebhookSinResolver(data.id, err);
   }
 });
 
