@@ -23,11 +23,17 @@ const SOFFICE = process.platform === 'win32'
   : 'soffice';
 
 // Cola de conversión — concurrency: 1 hoy, listo para escalar (solo cambiar el número).
-// El timeout lo maneja execAsync (mata el proceso hijo con SIGKILL),
+// El timeout lo maneja execAsync (mata el proceso hijo con SIGTERM),
 // no p-queue: así un soffice colgado no acumula procesos zombie en background.
 // Si una tarea falla o hace timeout, p-queue libera el slot y la cola sigue sola.
 const CONVERSION_TIMEOUT_MS = 60_000;
 const conversionQueue = new PQueue({ concurrency: 1 });
+
+// Mismos formatos que ofrece el <input accept="..."> del frontend — sin
+// esto, cualquier extensión se mandaba directo a LibreOffice sin validar
+// antes (LibreOffice es muy permisivo: convierte casi cualquier cosa en
+// vez de fallar, así que "confiar en que falle solo" no alcanza).
+const EXTENSIONES_PERMITIDAS = ['pdf', 'doc', 'docx', 'jpg', 'jpeg', 'png', 'xlsx', 'xls', 'pptx', 'ppt'];
 
 // diskStorage: escribe el archivo directamente a disco en vez de mantenerlo en RAM.
 // Necesario para archivos grandes (PDFs con imágenes, presentaciones, etc.).
@@ -54,6 +60,13 @@ const upload = multer({
     },
   }),
   limits: { fileSize: 300 * 1024 * 1024 },
+  fileFilter(req, file, cb) {
+    const ext = file.originalname.split('.').pop().toLowerCase();
+    if (!EXTENSIONES_PERMITIDAS.includes(ext)) {
+      return cb(new Error(`Formato .${ext} no soportado. Formatos permitidos: PDF, Word, Excel, PowerPoint, JPG o PNG.`));
+    }
+    cb(null, true);
+  },
 });
 
 const app = express();
@@ -107,8 +120,7 @@ const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KE
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // ── Procesar archivo: convertir a PDF (LibreOffice) + contar páginas + guardar en Storage ──
-const IMAGENES = ['jpg','jpeg','png','webp','gif','bmp','tiff'];
-const BUCKET   = 'archivos-pedidos';
+const BUCKET = 'archivos-pedidos';
 
 // Firma para poder borrar un archivo de Storage sin exigir login (el
 // checkout admite compra como invitado). Sin esto, DELETE /procesar-archivo
@@ -214,7 +226,7 @@ async function procesarArchivoHandler(req, res) {
       const outPath = join(tmpDir, safeDiskName.replace(/\.[^.]+$/, '.pdf'));
       await conversionQueue.add(async () => {
         const loProfile = join(tmpDir, 'lo-profile').replace(/\\/g, '/');
-        // timeout en execAsync mata el proceso soffice hijo con SIGKILL si se agota
+        // timeout en execAsync mata el proceso soffice hijo con SIGTERM si se agota
         await execAsync(
           `${SOFFICE} --headless --norestore -env:UserInstallation=file:///${loProfile} --convert-to pdf --outdir "${tmpDir}" "${inputPath}"`,
           { timeout: CONVERSION_TIMEOUT_MS }
@@ -266,6 +278,10 @@ app.delete('/procesar-archivo', procesarArchivoLimiter, async (req, res) => {
 
 // ── Limpieza de archivos huérfanos en Storage (llamado por cron externo) ─────
 const ORPHAN_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+// Storage gratis de Supabase es limitado (1GB) y los archivos de pedidos
+// completados no se borraban nunca — con volumen real, se llena en
+// semanas. 30 días de margen para reimpresiones/reclamos antes de borrar.
+const RETENCION_COMPLETADOS_MS = 30 * 24 * 60 * 60 * 1000;
 
 // storage.list() pagina de a `limit` — hay que recorrer todas las páginas,
 // nunca asumir que el bucket entero entra en una sola llamada.
@@ -303,7 +319,7 @@ app.post('/admin/limpiar-huerfanos', async (req, res) => {
       try {
         const { data: pedido, error: pedidoErr } = await supabase
           .from('pedidos')
-          .select('estado, created_at, mp_status')
+          .select('estado, created_at, mp_status, completado_at')
           .eq('pedido_id', pedidoId)
           .maybeSingle();
         if (pedidoErr) throw pedidoErr;
@@ -313,9 +329,16 @@ app.post('/admin/limpiar-huerfanos', async (req, res) => {
         // de 48hs, para no borrar los archivos de un pago que todavía
         // puede llegar a confirmarse.
         const pagoEnCurso = pedido?.mp_status === 'pending' || pedido?.mp_status === 'in_process';
-        const esHuerfano = !pagoEnCurso && (!pedido
+        const esHuerfanoAbandonado = !pagoEnCurso && (!pedido
           || (pedido.estado === 'pendiente' && (Date.now() - new Date(pedido.created_at).getTime()) > ORPHAN_MAX_AGE_MS));
-        if (!esHuerfano) continue;
+
+        // Retención: además de huérfanos abandonados, también se limpian
+        // los archivos de pedidos ya 'completado' hace más de 30 días.
+        const esCompletadoVencido = pedido?.estado === 'completado' && pedido.completado_at
+          && (Date.now() - new Date(pedido.completado_at).getTime()) > RETENCION_COMPLETADOS_MS;
+
+        const debeEliminarse = esHuerfanoAbandonado || esCompletadoVencido;
+        if (!debeEliminarse) continue;
 
         const archivos = await listAllStorage(pedidoId);
         if (archivos.length === 0) continue;
@@ -358,9 +381,12 @@ async function requireAdmin(req, res, next) {
 }
 
 app.get('/admin/pedidos', requireAdmin, async (req, res) => {
+  // Solo las columnas que admin.html realmente pinta (confirmado por
+  // grep sobre el archivo) — antes era select('*'), que mandaba de más
+  // (mp_preference_id, pedido_grupo_id, descuento, etc.) sin necesidad.
   const { data: pedidos, error } = await supabase
     .from('pedidos')
-    .select('*')
+    .select('pedido_id, estado, created_at, email, whatsapp, config, copies, hojas, zona, total')
     .order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
 
@@ -386,7 +412,9 @@ app.post('/admin/pedidos/:pedidoId/completar', requireAdmin, async (req, res) =>
   const { pedidoId } = req.params;
   const { error } = await supabase
     .from('pedidos')
-    .update({ estado: 'completado' })
+    // completado_at queda registrado para que la limpieza automática
+    // sepa desde cuándo contar los 30 días de retención de archivos.
+    .update({ estado: 'completado', completado_at: new Date().toISOString() })
     .eq('pedido_id', pedidoId);
   if (error) return res.status(500).json({ error: error.message });
   return res.json({ ok: true });
