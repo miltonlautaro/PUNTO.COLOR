@@ -2503,6 +2503,14 @@ function addToCart(){
     }, 2000);
     return;
   }
+  // Meta Pixel: el valor es solo la impresión — el envío se conoce
+  // recién al elegir zona. fbq puede no existir si un bloqueador
+  // frenó el snippet del <head>.
+  if (typeof fbq === 'function') fbq('track', 'AddToCart', {
+    value: (window._pedidoData && window._pedidoData.subtotalImp) || 0,
+    currency: 'ARS',
+  });
+
   // Si ya hay zona y dirección elegidas (típico del segundo pedido en
   // adelante dentro del mismo carrito — se preservan a propósito entre
   // ítems, ver _resetearDocumentoActual()), saltear la pantalla de zona:
@@ -3037,6 +3045,15 @@ function confirmarPedido(){
   if (_documentoActualListo()) itemsPedido.push(window._pedidoData);
   const primerItem = itemsPedido[0];
   const pedidoGrupoId = 'PG-' + Date.now() + '-' + Math.random().toString(36).slice(2,8);
+
+  // Meta Pixel: valor aproximado (impresión de todos los ítems + un solo
+  // envío, sin descontar código promo — el total exacto lo recalcula el
+  // backend). fbq puede no existir si un bloqueador frenó el snippet.
+  if (typeof fbq === 'function') fbq('track', 'InitiateCheckout', {
+    value: itemsPedido.reduce((a, it) => a + (it.subtotalImp || 0), 0) + (primerItem.subtotalEnv || 0),
+    currency: 'ARS',
+    num_items: itemsPedido.length,
+  });
 
   // "email" y "wa" NO están en los ítems guardados — se leen en vivo acá arriba.
   // liberarEstadoPedido() ya hace las 3 cosas del catch: no repetirlas.
