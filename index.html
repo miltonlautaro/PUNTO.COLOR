@@ -3055,6 +3055,22 @@ function confirmarPedido(){
     num_items: itemsPedido.length,
   });
 
+  // Cookies del pixel para la API de Conversiones (evento Purchase que el
+  // backend manda a Meta cuando el webhook confirma el pago). _fbc solo
+  // existe si el visitante llegó desde un anuncio (fbclid); si el pixel no
+  // llegó a crearla pero el fbclid sigue en la URL, se construye a mano
+  // con el formato que espera Meta (fb.1.<timestamp>.<fbclid>).
+  const _metaCookie = function(name){
+    const m = document.cookie.match('(^|;)\\s*' + name + '\\s*=\\s*([^;]+)');
+    return m ? m.pop() : null;
+  };
+  let _fbc = _metaCookie('_fbc');
+  if (!_fbc) {
+    const fbclid = new URLSearchParams(window.location.search).get('fbclid');
+    if (fbclid) _fbc = 'fb.1.' + Date.now() + '.' + fbclid;
+  }
+  const _fbp = _metaCookie('_fbp');
+
   // "email" y "wa" NO están en los ítems guardados — se leen en vivo acá arriba.
   // liberarEstadoPedido() ya hace las 3 cosas del catch: no repetirlas.
   // reiniciarPedido() va SOLO después de pago aprobado confirmado,
@@ -3089,6 +3105,7 @@ function confirmarPedido(){
         zona: primerItem.zona, direccion: primerItem.direccion,
         costoEnvio: primerItem.subtotalEnv,
         email, whatsapp: wa, codigo: primerItem.codigo || null,
+        fbp: _fbp || null, fbc: _fbc || null,
       }),
     });
   })

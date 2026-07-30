@@ -14,7 +14,7 @@ import { tmpdir } from 'os';
 import PQueue from 'p-queue';
 import { rateLimit } from 'express-rate-limit';
 import { Resend } from 'resend';
-import { randomUUID, randomBytes, createHmac, timingSafeEqual } from 'crypto';
+import { randomUUID, randomBytes, createHmac, createHash, timingSafeEqual } from 'crypto';
 
 const execAsync = promisify(exec);
 // soffice en PATH en Linux/Docker; en Windows ajustar si es necesario
@@ -445,7 +445,7 @@ function distribuirDescuento(pedidos, descuentoTotal, subtotalImpTotal) {
 }
 
 app.post('/checkout', async (req, res) => {
-  const { pedidoGrupoId, pedidos, zona, direccion, costoEnvio, email, whatsapp, codigo } = req.body;
+  const { pedidoGrupoId, pedidos, zona, direccion, costoEnvio, email, whatsapp, codigo, fbp, fbc } = req.body;
 
   if (!pedidoGrupoId || !email) {
     return res.status(400).json({ error: 'pedidoGrupoId y email son obligatorios' });
@@ -571,11 +571,23 @@ app.post('/checkout', async (req, res) => {
   // ("pedido fantasma"). Por eso: reintentar unas veces (cubre fallos
   // momentáneos de Supabase) y, si definitivamente falla, avisar por
   // email con los datos necesarios para conciliar a mano.
+  // Datos de matching para la API de Conversiones de Meta (evento Purchase
+  // que manda el webhook al confirmarse el pago). Solo strings acotados —
+  // vienen del navegador del cliente, no se confía en su formato.
+  const limpiarTrack = (v) => (typeof v === 'string' && v.length <= 500) ? v : null;
+  const metaTrack = {
+    fbp: limpiarTrack(fbp),
+    fbc: limpiarTrack(fbc),
+    ip:  req.ip || null,
+    ua:  limpiarTrack(req.get('user-agent')),
+  };
+
   const filas = pedidos.map(p => ({
     pedido_id:        p.pedidoId,
     pedido_grupo_id:  pedidoGrupoId,
     estado:           'pendiente',
     mp_preference_id: mpPreference.id,
+    meta_track:       metaTrack,
     total:            totalParaPago,   // total del GRUPO, repetido en cada fila
     descuento:        descuentoServer > 0 ? descuentoServer : null, // ídem
     subtotal_imp:     p.subtotalImp,
@@ -703,6 +715,73 @@ async function enviarEmailConfirmacion(filas) {
     // Un fallo acá NUNCA debe afectar el resto del webhook — el pedido
     // ya quedó marcado 'pagado' independientemente de si el email salió.
     console.error('Error enviando email de confirmación:', err);
+  }
+}
+
+// ── Purchase a la API de Conversiones de Meta ────────────────────────────────
+// Se dispara en el mismo punto que el email de confirmación: solo cuando el
+// webhook hace la transición real a 'pagado' (nunca en reintentos de MP para
+// un pago ya confirmado), así el evento sale una sola vez por pedido.
+// Server-side porque el cliente puede no volver nunca al sitio después de
+// pagar (Rapipago días después, pestaña cerrada) — el navegador no alcanza.
+const META_PIXEL_ID = '1742512147060663';
+
+function hashMeta(str) {
+  return createHash('sha256').update(str).digest('hex');
+}
+
+async function enviarPurchaseCAPI(filas) {
+  if (!process.env.META_CAPI_TOKEN) {
+    console.warn('⚠️  META_CAPI_TOKEN no configurado — no se envía Purchase a Meta');
+    return;
+  }
+  try {
+    const primera = filas[0];
+    const userData = {};
+
+    if (primera.email) userData.em = [hashMeta(primera.email.trim().toLowerCase())];
+    if (primera.whatsapp) {
+      // Meta espera E.164 en dígitos. El checkout ya valida 8-15 dígitos;
+      // si el cliente lo escribió sin código de país, se asume Argentina.
+      let ph = String(primera.whatsapp).replace(/\D/g, '');
+      if (!ph.startsWith('54')) ph = '54' + ph;
+      userData.ph = [hashMeta(ph)];
+    }
+    const track = primera.meta_track || {};
+    if (track.fbp) userData.fbp = track.fbp;
+    if (track.fbc) userData.fbc = track.fbc;
+    if (track.ip)  userData.client_ip_address = track.ip;
+    if (track.ua)  userData.client_user_agent = track.ua;
+
+    const body = {
+      data: [{
+        event_name:       'Purchase',
+        event_time:       Math.floor(Date.now() / 1000),
+        event_id:         primera.pedido_grupo_id || primera.pedido_id,
+        action_source:    'website',
+        event_source_url: FRONTEND_URL,
+        user_data:        userData,
+        custom_data: {
+          value:     Number(primera.total) || 0,
+          currency:  'ARS',
+          num_items: filas.length,
+        },
+      }],
+    };
+    // Con esta variable seteada, el evento aparece en "Probar eventos" del
+    // Events Manager en vez de contarse como tráfico real — solo para tests.
+    if (process.env.META_TEST_EVENT_CODE) body.test_event_code = process.env.META_TEST_EVENT_CODE;
+
+    const resp = await fetch(
+      `https://graph.facebook.com/v21.0/${META_PIXEL_ID}/events?access_token=${process.env.META_CAPI_TOKEN}`,
+      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+    );
+    const json = await resp.json();
+    if (!resp.ok) console.error('Meta CAPI error:', JSON.stringify(json));
+    else console.log(`📈 Purchase enviado a Meta | event_id=${body.data[0].event_id} | events_received=${json.events_received}`);
+  } catch (err) {
+    // Igual que el email: un fallo acá nunca debe afectar el webhook.
+    console.error('Error enviando Purchase a Meta CAPI:', err);
   }
 }
 
@@ -865,6 +944,7 @@ app.post('/webhook', async (req, res) => {
         console.log(`✅ Pedido(s) con ${matchColumn}=${ref} marcado(s) como pagado`);
         if (filasActualizadas && filasActualizadas.length > 0) {
           await enviarEmailConfirmacion(filasActualizadas);
+          await enviarPurchaseCAPI(filasActualizadas);
         }
       }
     } else {
