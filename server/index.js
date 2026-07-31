@@ -785,6 +785,51 @@ async function enviarPurchaseCAPI(filas) {
   }
 }
 
+// ── Notificación al dueño por Telegram ───────────────────────────────────────
+// Mismo punto de disparo que el email y el Purchase de Meta: solo en la
+// transición real a 'pagado', así llega una sola vez por pedido.
+async function notificarPedidoTelegram(filas) {
+  if (!process.env.TELEGRAM_BOT_TOKEN || !process.env.TELEGRAM_CHAT_ID) {
+    console.warn('⚠️  TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID no configurados — no se notifica el pedido');
+    return;
+  }
+  try {
+    const primera = filas[0];
+    const ref = primera.pedido_grupo_id || primera.pedido_id;
+    const archivos = filas.flatMap(f => f.archivos || []);
+    const dir = primera.direccion || {};
+    const calle = [dir.calle, dir.altura].filter(Boolean).join(' ');
+    const extraDir = [dir.piso && `piso ${dir.piso}`, dir.depto && `depto ${dir.depto}`].filter(Boolean).join(', ');
+
+    const lineas = [
+      '🖨️ ¡Nuevo pedido pagado!',
+      '',
+      `📋 ${ref}`,
+      `💰 Total: $ ${Number(primera.total).toLocaleString('es-AR')}`,
+      `📄 ${filas.length} ítem(s): ${archivos.join(', ') || 'sin nombres'}`,
+      `📍 ${primera.zona?.name || '—'} — ${calle || 'sin dirección'}${extraDir ? ' (' + extraDir + ')' : ''}`,
+      `👤 ${primera.email || '—'}${primera.whatsapp ? ' · ' + primera.whatsapp : ''}`,
+      '',
+      '👉 https://puntocolorimpresiones.com/admin.html',
+    ];
+
+    const resp = await fetch(
+      `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: process.env.TELEGRAM_CHAT_ID, text: lineas.join('\n') }),
+      },
+    );
+    const json = await resp.json();
+    if (!json.ok) console.error('Telegram sendMessage error:', JSON.stringify(json));
+    else console.log(`📬 Notificación de Telegram enviada | ${ref}`);
+  } catch (err) {
+    // Igual que el email y CAPI: un fallo acá nunca debe afectar el webhook.
+    console.error('Error notificando pedido por Telegram:', err);
+  }
+}
+
 // ── "Pedido fantasma": preferencia de MP creada pero insert a Supabase falló ──
 // Reintenta el insert unas pocas veces (cubre caídas momentáneas) antes de
 // darse por vencido y avisar por email con lo necesario para conciliar a mano.
@@ -945,6 +990,7 @@ app.post('/webhook', async (req, res) => {
         if (filasActualizadas && filasActualizadas.length > 0) {
           await enviarEmailConfirmacion(filasActualizadas);
           await enviarPurchaseCAPI(filasActualizadas);
+          await notificarPedidoTelegram(filasActualizadas);
         }
       }
     } else {
