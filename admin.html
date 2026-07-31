@@ -34,6 +34,24 @@
   .pedido-info{font-size:.85rem;line-height:1.6;color:#4a2e0a;margin-bottom:12px}
   .pedido-info strong{color:var(--ink)}
 
+  .entrega-box{background:var(--kraft);border-radius:12px;padding:12px 16px;margin-bottom:12px;font-size:.9rem;line-height:1.5}
+  .entrega-box .dir-principal{font-weight:800;font-size:1rem;color:var(--ink)}
+  .entrega-box .dir-zona{font-size:.78rem;color:#7a5a2a;font-weight:700}
+  .entrega-box .dir-ref{font-style:italic;color:#7a5a2a;font-size:.82rem}
+
+  .total-grupo{font-family:'Fredoka One',sans-serif;font-size:1.15rem;color:var(--ink);margin-bottom:12px}
+
+  .item-section{border:1px solid rgba(160,110,40,.25);border-radius:12px;padding:14px;margin-bottom:10px}
+  .item-section .item-titulo{font-size:.75rem;font-weight:800;text-transform:uppercase;letter-spacing:.5px;color:#7a5a2a;margin-bottom:8px}
+
+  .specs-chips{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
+  .spec-chip{
+    background:var(--kraft);border:1.5px solid rgba(160,110,40,.35);border-radius:10px;
+    padding:6px 12px;font-weight:800;font-size:.9rem;color:var(--ink);
+  }
+  /* Los dos descuidos más caros al armar un pedido: color y copias extra */
+  .spec-chip.destacado{background:#fde9e7;border-color:var(--accent);color:#a02318}
+
   .archivos-list{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px}
   .archivo-item{display:flex;gap:4px;align-items:center}
   .archivos-list a{
@@ -155,67 +173,114 @@ async function cargarPedidos(){
       vacioEl.style.display = 'block';
       return;
     }
-    data.pedidos.forEach(p => listEl.appendChild(renderPedido(p)));
+    // Agrupar por pago: cada ítem de un carrito es una fila propia en la DB,
+    // pero comparten pedido_grupo_id (y el total del grupo repetido). Filas
+    // viejas sin grupo se tratan como grupo de un solo ítem.
+    const grupos = new Map();
+    data.pedidos.forEach(p => {
+      const clave = p.pedido_grupo_id || p.pedido_id;
+      if (!grupos.has(clave)) grupos.set(clave, []);
+      grupos.get(clave).push(p);
+    });
+    grupos.forEach((items, clave) => listEl.appendChild(renderGrupo(clave, items)));
   } catch (err) {
     cargaEl.textContent = 'Error al cargar pedidos. Reintentá con el botón Actualizar.';
   }
 }
 
-function renderPedido(p){
-  const div = document.createElement('div');
-  div.className = 'pedido-card';
+function chipsSpecs(p){
+  const config = p.config || {};
+  const chips = [];
+  // tinta color y copias extra son los dos descuidos más caros al armar
+  if (config.tinta)   chips.push({ txt: config.tinta,               destacar: config.tinta === 'color' });
+  if (config.cara)    chips.push({ txt: config.cara,                destacar: false });
+  if (config.acabado) chips.push({ txt: config.acabado,             destacar: false });
+  if (p.copies)       chips.push({ txt: `${p.copies} copia(s)`,     destacar: Number(p.copies) > 1 });
+  if (p.hojas)        chips.push({ txt: `${p.hojas} hoja(s)`,       destacar: false });
+  if (chips.length === 0) return '<span class="sin-archivos">Sin especificaciones</span>';
+  return chips.map(c =>
+    `<span class="spec-chip${c.destacar ? ' destacado' : ''}">${escapeHtml(c.txt)}</span>`
+  ).join('');
+}
 
-  const estadoClass = 'estado-' + (p.estado || 'pendiente');
-  const archivosHtml = (p.archivosStorage && p.archivosStorage.length > 0)
+function archivosHtmlDe(p, pedidoIds, estado){
+  return (p.archivosStorage && p.archivosStorage.length > 0)
     ? p.archivosStorage.map(a => `
         <span class="archivo-item">
           <a href="${a.url || '#'}" target="_blank" rel="noopener">⬇ ${escapeHtml(a.nombre)}</a>
           <button class="imprimir-btn" ${a.url ? '' : 'disabled'}
-            onclick='imprimirArchivo(${JSON.stringify(a.url)}, ${JSON.stringify(p.pedido_id)}, ${JSON.stringify(p.estado)}, this)'>🖨️</button>
+            onclick='imprimirArchivo(${JSON.stringify(a.url)}, ${JSON.stringify(pedidoIds)}, ${JSON.stringify(estado)}, this)'>🖨️</button>
         </span>
       `).join('')
     : '<span class="sin-archivos">Sin archivos</span>';
+}
 
-  const config = p.config || {};
-  const specs = [
-    config.tinta, config.cara, config.acabado,
-    p.copies ? `${p.copies} copia(s)` : null,
-    p.hojas ? `${p.hojas} hoja(s)` : null,
-  ].filter(Boolean).join(' · ');
+function renderGrupo(clave, items){
+  const div = document.createElement('div');
+  div.className = 'pedido-card';
+
+  const primera = items[0];
+  const estado = primera.estado || 'pendiente';
+  const estadoClass = 'estado-' + estado;
+  const pedidoIds = items.map(p => p.pedido_id);
+
+  // Dirección de entrega — dato principal; zona como secundario
+  const dir = primera.direccion || {};
+  const calle = [dir.calle, dir.altura].filter(Boolean).join(' ');
+  const extraDir = [dir.piso && `piso ${dir.piso}`, dir.depto && `depto ${dir.depto}`].filter(Boolean).join(', ');
+  const zonaName = (primera.zona && primera.zona.name) || null;
+  const entregaHtml = `
+    <div class="entrega-box">
+      <span class="dir-principal">📍 ${escapeHtml(calle || 'Sin dirección')}${extraDir ? ' — ' + escapeHtml(extraDir) : ''}</span>
+      ${zonaName ? ` <span class="dir-zona">(${escapeHtml(zonaName)})</span>` : ''}
+      ${dir.referencia ? `<br><span class="dir-ref">"${escapeHtml(dir.referencia)}"</span>` : ''}
+    </div>`;
+
+  const itemsHtml = items.map((p, i) => `
+    <div class="item-section">
+      <div class="item-titulo">${items.length > 1 ? `Ítem ${i + 1} de ${items.length} · ` : ''}${escapeHtml(p.pedido_id)}</div>
+      <div class="specs-chips">${chipsSpecs(p)}</div>
+      <div class="archivos-list">${archivosHtmlDe(p, pedidoIds, estado)}</div>
+    </div>`).join('');
 
   div.innerHTML = `
     <div class="pedido-head">
-      <div class="pedido-id">${escapeHtml(p.pedido_id)}</div>
-      <div class="estado-badge ${estadoClass}">${escapeHtml(p.estado || 'pendiente')}</div>
+      <div class="pedido-id">${escapeHtml(clave)}</div>
+      <div class="estado-badge ${estadoClass}">${escapeHtml(estado)}</div>
     </div>
     <div class="pedido-info">
-      <strong>Fecha:</strong> ${fmtFecha(p.created_at)}<br>
-      <strong>Cliente:</strong> ${escapeHtml(p.email || '—')} ${p.whatsapp ? '· ' + escapeHtml(p.whatsapp) : ''}<br>
-      <strong>Specs:</strong> ${escapeHtml(specs || '—')}<br>
-      <strong>Zona:</strong> ${escapeHtml(p.zona || '—')} · <strong>Total:</strong> ${fmtMoney(p.total)}
+      <strong>Fecha:</strong> ${fmtFecha(primera.created_at)}<br>
+      <strong>Cliente:</strong> ${escapeHtml(primera.email || '—')} ${primera.whatsapp ? '· ' + escapeHtml(primera.whatsapp) : ''}
     </div>
-    <div class="archivos-list">${archivosHtml}</div>
+    ${entregaHtml}
+    <div class="total-grupo">Total: ${fmtMoney(primera.total)}</div>
+    ${itemsHtml}
   `;
 
-  if (p.estado === 'pagado') {
+  if (estado === 'pagado') {
     const btn = document.createElement('button');
     btn.className = 'completar-btn';
     btn.textContent = '✓ Marcar como completado';
-    btn.onclick = () => completarPedido(p.pedido_id, btn);
+    btn.onclick = () => completarGrupo(pedidoIds, btn);
     div.appendChild(btn);
   }
 
   return div;
 }
 
-async function completarPedido(pedidoId, btnEl){
+// Completa TODAS las filas del grupo (el endpoint es por pedido_id — se
+// llama una vez por ítem; N es chico, siempre ≤ 10 ítems por carrito).
+async function completarGrupo(pedidoIds, btnEl){
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = 'Actualizando...'; }
   const token = await getToken();
   try {
-    const res = await fetch(PC_SERVER + '/admin/pedidos/' + encodeURIComponent(pedidoId) + '/completar', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + token }
-    });
-    if (!res.ok) throw new Error();
+    for (const pedidoId of pedidoIds) {
+      const res = await fetch(PC_SERVER + '/admin/pedidos/' + encodeURIComponent(pedidoId) + '/completar', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + token }
+      });
+      if (!res.ok) throw new Error();
+    }
     await cargarPedidos();
   } catch (err) {
     if (btnEl) { btnEl.disabled = false; btnEl.textContent = '✓ Marcar como completado'; }
@@ -226,7 +291,7 @@ async function completarPedido(pedidoId, btnEl){
 // Abre el PDF en una pestaña propia (mismo origen, vía blob) para poder
 // disparar window.print() y escuchar 'afterprint' — un PDF cross-origin
 // (el signed URL de Supabase) no permite ninguna de las dos cosas.
-async function imprimirArchivo(url, pedidoId, estadoActual, btnEl){
+async function imprimirArchivo(url, pedidoIds, estadoActual, btnEl){
   if (!url) return;
   btnEl.disabled = true;
   const originalText = btnEl.textContent;
@@ -247,10 +312,12 @@ async function imprimirArchivo(url, pedidoId, estadoActual, btnEl){
     // afterprint se dispara al cerrar el diálogo, imprima o cancele el
     // usuario — el navegador no expone cuál de las dos pasó. Por eso
     // preguntamos explícitamente antes de marcar el pedido como completado.
+    // El confirm completa el GRUPO entero: si quedan archivos por imprimir,
+    // responder Cancelar y completar después con el botón de la tarjeta.
     w.addEventListener('afterprint', () => {
       URL.revokeObjectURL(blobUrl);
-      if (estadoActual === 'pagado' && confirm('¿Se imprimió correctamente este archivo?')) {
-        completarPedido(pedidoId);
+      if (estadoActual === 'pagado' && confirm('¿Se imprimió todo el pedido correctamente? (Se marca completo el pedido entero)')) {
+        completarGrupo(pedidoIds);
       }
     });
   } catch (err) {

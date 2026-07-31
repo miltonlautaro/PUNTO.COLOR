@@ -386,7 +386,7 @@ app.get('/admin/pedidos', requireAdmin, async (req, res) => {
   // (mp_preference_id, pedido_grupo_id, descuento, etc.) sin necesidad.
   const { data: pedidos, error } = await supabase
     .from('pedidos')
-    .select('pedido_id, estado, created_at, email, whatsapp, config, copies, hojas, zona, total')
+    .select('pedido_id, pedido_grupo_id, estado, created_at, email, whatsapp, config, copies, hojas, zona, direccion, total')
     .order('created_at', { ascending: false });
   if (error) return res.status(500).json({ error: error.message });
 
