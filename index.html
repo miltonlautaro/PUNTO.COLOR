@@ -175,6 +175,12 @@
 .zsl-item[data-id="ov"] .zsl-dot{background:#3949ab}
 .zsl-item[data-id="sb"] .zsl-dot{background:#9b5de5}
 .zsl-item[data-id="ca"] .zsl-dot{background:#f5a623}
+.zsl-dot-pe{background:#4a2e0a}
+.zsl-pe-toggle .zsl-chevron{margin-left:auto;transition:transform .2s;color:var(--soft)}
+.zsl-pe-toggle.open .zsl-chevron{transform:rotate(180deg)}
+.zsl-pe-sublista{display:none;padding-left:14px}
+.zsl-pe-sublista.show{display:block}
+.zsl-sub-item{font-size:.92em;padding-top:6px;padding-bottom:6px}
 
 /* Responsive */
 @media(max-width:860px){
@@ -2533,6 +2539,16 @@ const ZONAS_ENTREGA = {
   'ov': {name:'Oro Verde',           precio:4000},
   'sb': {name:'San Benito',          precio:3800},
   'ca': {name:'Colonia Avellaneda',  precio:4200},
+  'pe-terminal': {name:'Punto de Encuentro — Terminal de Ómnibus',  precio:1500},
+  'pe-uner':     {name:'Punto de Encuentro — UNER Oro Verde',       precio:1500},
+  'pe-plaza':    {name:'Punto de Encuentro — Plaza San Miguel',     precio:1500},
+};
+// Texto que va a direccionEntrega.calle al elegir un punto de encuentro —
+// distinto del "name" de arriba, que es la etiqueta de la zona.
+const PUNTOS_ENCUENTRO_DIRECCION = {
+  'pe-terminal': 'Terminal de Ómnibus, Av. Ramírez y Ruiz Moreno',
+  'pe-uner':     'Oro Verde, UNER, Av. Los Laureles',
+  'pe-plaza':    'Plaza San Miguel, Laprida y Buenos Aires',
 };
 let zonaSeleccionada = null;
 var codigoPromoActual = null; // { codigo, tipo, valor } | null — leído en calcularPedido()
@@ -2659,6 +2675,20 @@ function confirmarZona(){
 
   cerrarZonas();
   abrirResumen();
+}
+
+function togglePuntoEncuentro(){
+  document.getElementById('pe-sub-lista').classList.toggle('show');
+  document.querySelector('.zsl-pe-toggle').classList.toggle('open');
+}
+
+function seleccionarPuntoEncuentro(id){
+  seleccionarZona(id);   // reutilizada tal cual: zonaSeleccionada, resaltado, botón "ready"
+  const calleInput = document.getElementById('addr-calle');
+  calleInput.value = PUNTOS_ENCUENTRO_DIRECCION[id];
+  calleInput.readOnly = true;   // evita que quede editable y alguien la pise por error
+  calleInput.classList.remove('addr-err');
+  document.getElementById('addr-calle-err').classList.remove('show');
 }
 
 
@@ -3970,6 +4000,12 @@ updateSummary();
 <div class="zsl-item" data-id="ov" onclick="seleccionarZona('ov')"><span class="zsl-dot"></span><span class="zsl-name">Oro Verde</span><span class="zsl-precio"></span></div>
 <div class="zsl-item" data-id="sb" onclick="seleccionarZona('sb')"><span class="zsl-dot"></span><span class="zsl-name">San Benito</span><span class="zsl-precio"></span></div>
 <div class="zsl-item" data-id="ca" onclick="seleccionarZona('ca')"><span class="zsl-dot"></span><span class="zsl-name">Colonia Avellaneda</span><span class="zsl-precio"></span></div>
+<div class="zsl-item zsl-pe-toggle" onclick="togglePuntoEncuentro()"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Punto de Encuentro</span><span class="zsl-chevron">▾</span></div>
+<div class="zsl-pe-sublista" id="pe-sub-lista">
+  <div class="zsl-item zsl-sub-item" data-id="pe-terminal" onclick="seleccionarPuntoEncuentro('pe-terminal')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Terminal de Ómnibus</span><span class="zsl-precio"></span></div>
+  <div class="zsl-item zsl-sub-item" data-id="pe-uner" onclick="seleccionarPuntoEncuentro('pe-uner')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">UNER, Oro Verde</span><span class="zsl-precio"></span></div>
+  <div class="zsl-item zsl-sub-item" data-id="pe-plaza" onclick="seleccionarPuntoEncuentro('pe-plaza')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Plaza San Miguel</span><span class="zsl-precio"></span></div>
+</div>
       </div>
 
       <!-- Dirección de entrega -->
@@ -4379,6 +4415,23 @@ function pintarPreciosZonas(){
     if (zona && precioEl) precioEl.textContent = '$' + zona.precio;
   });
 }
+// Si se venía de elegir un punto de encuentro (calle bloqueada con el texto
+// fijo) y ahora se clickea una zona real, libera el campo para que el
+// cliente pueda escribir su dirección — sin tocar los onclick existentes
+// de las 7 zonas, delegado sobre el contenedor de la lista.
+document.querySelector('.zs-zonas-lista').addEventListener('click', function(e){
+  const item = e.target.closest('.zsl-item[data-id]');
+  if (item && !item.dataset.id.startsWith('pe-')) {
+    const calleInput = document.getElementById('addr-calle');
+    // Si venía bloqueado (se había elegido un punto de encuentro), además
+    // de desbloquear hay que vaciar el texto fijo — si no, confirmar acá
+    // guardaría "Terminal de Ómnibus..." como si fuera la casa del cliente.
+    // Si ya estaba editable (venía de otra zona real), no se toca lo que
+    // el cliente haya escrito.
+    if (calleInput.readOnly) calleInput.value = '';
+    calleInput.readOnly = false;
+  }
+});
 pintarPreciosZonas();
 cpInitDots();
 </script>
