@@ -180,7 +180,8 @@
 .zsl-pe-toggle.open .zsl-chevron{transform:rotate(180deg)}
 .zsl-pe-sublista{display:none;padding-left:14px}
 .zsl-pe-sublista.show{display:block}
-.zsl-sub-item{font-size:.92em;padding-top:6px;padding-bottom:6px}
+.zsl-sub-item{font-size:.92em;padding-top:6px;padding-bottom:6px;flex-wrap:wrap}
+.zsl-horario{flex-basis:100%;font-size:.72rem;color:var(--soft);padding-left:20px}
 
 /* Responsive */
 @media(max-width:860px){
@@ -4002,9 +4003,9 @@ updateSummary();
 <div class="zsl-item" data-id="ca" onclick="seleccionarZona('ca')"><span class="zsl-dot"></span><span class="zsl-name">Colonia Avellaneda</span><span class="zsl-precio"></span></div>
 <div class="zsl-item zsl-pe-toggle" onclick="togglePuntoEncuentro()"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Punto de Encuentro</span><span class="zsl-chevron">▾</span></div>
 <div class="zsl-pe-sublista" id="pe-sub-lista">
-  <div class="zsl-item zsl-sub-item" data-id="pe-terminal" onclick="seleccionarPuntoEncuentro('pe-terminal')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Terminal de Ómnibus</span><span class="zsl-precio"></span></div>
-  <div class="zsl-item zsl-sub-item" data-id="pe-uner" onclick="seleccionarPuntoEncuentro('pe-uner')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">UNER, Oro Verde</span><span class="zsl-precio"></span></div>
-  <div class="zsl-item zsl-sub-item" data-id="pe-plaza" onclick="seleccionarPuntoEncuentro('pe-plaza')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Plaza San Miguel</span><span class="zsl-precio"></span></div>
+  <div class="zsl-item zsl-sub-item" data-id="pe-terminal" onclick="seleccionarPuntoEncuentro('pe-terminal')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Terminal de Ómnibus</span><span class="zsl-precio"></span><span class="zsl-horario">🕒 Martes y viernes 10:45 - 11:00hs</span></div>
+  <div class="zsl-item zsl-sub-item" data-id="pe-uner" onclick="seleccionarPuntoEncuentro('pe-uner')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">UNER, Oro Verde</span><span class="zsl-precio"></span><span class="zsl-horario">🕒 Lunes y jueves 10:45 - 11:00hs</span></div>
+  <div class="zsl-item zsl-sub-item" data-id="pe-plaza" onclick="seleccionarPuntoEncuentro('pe-plaza')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Plaza San Miguel</span><span class="zsl-precio"></span><span class="zsl-horario">🕒 Miércoles 10:45 - 11:00hs</span></div>
 </div>
       </div>
 
