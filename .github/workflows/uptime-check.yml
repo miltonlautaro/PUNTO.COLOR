@@ -1,0 +1,58 @@
+name: Uptime check
+
+# Chequea cada 10 minutos que el frontend (Netlify) y el backend (Railway,
+# vía /health) respondan. Si alguno falla, avisa por el mismo bot de
+# Telegram que ya se usa para notificar pedidos pagados (server/index.js,
+# notificarPedidoTelegram()) — mismo chat, así todo llega junto.
+#
+# Simplificación deliberada: avisa en CADA corrida que encuentre algo
+# caído (no solo en la transición up->down), así que durante una caída
+# real vas a recibir un mensaje cada 10 minutos hasta que se resuelva.
+# Es más simple que trackear estado entre corridas y, para esto, un aviso
+# repetido mientras el sitio sigue caído no molesta.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:   # permite disparar una corrida manual desde GitHub
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Chequear backend (Railway)
+        id: backend
+        run: |
+          if curl -fsS --max-time 10 https://api.puntocolorimpresiones.com/health > /dev/null; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Chequear frontend (Netlify)
+        id: frontend
+        run: |
+          if curl -fsS --max-time 10 https://www.puntocolorimpresiones.com > /dev/null; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Avisar por Telegram si algo está caído
+        if: steps.backend.outputs.ok == 'false' || steps.frontend.outputs.ok == 'false'
+        env:
+          BACKEND_OK: ${{ steps.backend.outputs.ok }}
+          FRONTEND_OK: ${{ steps.frontend.outputs.ok }}
+        run: |
+          MSG="🔴 Punto Color — algo está caído"
+          if [ "$BACKEND_OK" = "false" ]; then
+            MSG="$MSG
+          ❌ Backend (api.puntocolorimpresiones.com) no responde"
+          fi
+          if [ "$FRONTEND_OK" = "false" ]; then
+            MSG="$MSG
+          ❌ Frontend (www.puntocolorimpresiones.com) no responde"
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendMessage" \
+            --data-urlencode "chat_id=${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode "text=$MSG"
