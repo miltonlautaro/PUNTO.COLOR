@@ -920,14 +920,54 @@ footer{
 }
 footer strong{color:var(--ink)}
 
-/* Edit btn (mantenido) */
+/* Botones flotantes: WhatsApp (abajo) e Instagram (encima) */
 #edit-btn{position:fixed;bottom:24px;right:24px;z-index:200;
   width:46px;height:46px;border-radius:50%;
   display:flex;align-items:center;justify-content:center;
-  background:var(--ink);color:#f5e8cf;text-decoration:none;
-  border:none;font-size:1.1rem;cursor:none;
-  box-shadow:0 4px 20px rgba(0,0,0,.25);transition:transform .2s,background .2s}
-#edit-btn:hover{transform:scale(1.1);background:#25D366}
+  text-decoration:none;
+  border:none;cursor:none;
+  box-shadow:0 4px 20px rgba(0,0,0,.25);transition:transform .2s}
+#edit-btn:hover{transform:scale(1.1)}
+/* El logo de WhatsApp trae ~47% de margen transparente en el PNG: se
+   escala para que el círculo verde llene los 46px y quede del mismo
+   tamaño visual que el de Instagram (que sí ocupa todo su lienzo).
+   pointer-events:none evita que el margen transparente, que sobresale
+   del botón, robe clicks al botón de Instagram de arriba. */
+#edit-btn img{width:100%;height:100%;transform:scale(1.9);pointer-events:none}
+
+#ig-btn{position:fixed;bottom:82px;right:24px;z-index:200;
+  width:46px;height:46px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  text-decoration:none;cursor:none;
+  box-shadow:0 4px 20px rgba(0,0,0,.25);transition:transform .2s}
+#ig-btn:hover{transform:scale(1.1)}
+#ig-btn img{width:100%;height:100%;border-radius:50%;pointer-events:none}
+
+.ig-tooltip{
+  position:absolute;right:58px;top:50%;
+  background:var(--ink);color:#f5e8cf;
+  font-family:'Fredoka One',sans-serif;font-size:.72rem;
+  padding:7px 12px;border-radius:14px;white-space:nowrap;
+  box-shadow:0 4px 14px rgba(0,0,0,.2);
+  transform-origin:right center;
+  /* translateY(-50%) va repetido en cada keyframe: la animación pisa
+     por completo la propiedad transform, no se acumula con la de acá. */
+  transform:translateY(-50%);
+  animation:igBreath 2.8s ease-in-out infinite;
+}
+/* Colita de la nube, apuntando al botón */
+.ig-tooltip::after{
+  content:'';position:absolute;right:-5px;top:50%;
+  transform:translateY(-50%);
+  border:6px solid transparent;border-right:0;border-left-color:var(--ink);
+}
+@keyframes igBreath{
+  0%,100%{transform:translateY(-50%) scale(1)}
+  50%    {transform:translateY(-50%) scale(1.07)}
+}
+@media(prefers-reduced-motion:reduce){
+  .ig-tooltip{animation:none}
+}
 
 
 /* ═══════════════════════════════════════════
@@ -1787,7 +1827,11 @@ src="https://www.facebook.com/tr?id=1742512147060663&ev=PageView&noscript=1"
   <p style="margin-top:5px">Hecho con 💛 para estudiantes y profesionales</p>
 </footer>
 
-<a id="edit-btn" href="https://wa.me/5493436124797" target="_blank" rel="noopener" title="Chatear por WhatsApp">💬</a>
+<a id="ig-btn" href="https://www.instagram.com/puntocolor.impresiones/" target="_blank" rel="noopener" title="Seguinos en Instagram">
+  <span class="ig-tooltip">¡Seguinos en Instagram!</span>
+  <img src="images/instagram.png" alt="Instagram">
+</a>
+<a id="edit-btn" href="https://wa.me/5493436124797" target="_blank" rel="noopener" title="Chatear por WhatsApp"><img src="images/Whatsapp.png" alt="WhatsApp"></a>
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
 <script>
@@ -3177,6 +3221,7 @@ function showPage(name){
   comoPedir.hidden = (name !== 'como-pedir');
   document.querySelector('footer').hidden          = (name !== 'tienda');
   document.getElementById('edit-btn').hidden       = (name !== 'tienda');
+  document.getElementById('ig-btn').hidden          = (name !== 'tienda');
   document.querySelectorAll('.nav-links a[data-page]').forEach(a =>
     a.classList.toggle('active', a.dataset.page === name));
   window.scrollTo(0, 0);
