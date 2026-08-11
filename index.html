@@ -954,7 +954,13 @@ footer strong{color:var(--ink)}
      por completo la propiedad transform, no se acumula con la de acá. */
   transform:translateY(-50%);
   animation:igBreath 2.8s ease-in-out infinite;
+  /* Solo opacity/visibility: transicionar transform pelearía con la
+     animación de respiración. */
+  transition:opacity .6s ease, visibility .6s ease;
 }
+/* La nube llama la atención al entrar, pero después estorba: se
+   desvanece sola a los 8 segundos (ver el setTimeout del final). */
+.ig-tooltip.oculta{opacity:0;visibility:hidden}
 /* Colita de la nube, apuntando al botón */
 .ig-tooltip::after{
   content:'';position:absolute;right:-5px;top:50%;
@@ -4480,5 +4486,12 @@ document.querySelector('.zs-zonas-lista').addEventListener('click', function(e){
 });
 pintarPreciosZonas();
 cpInitDots();
+
+// La nube "¡Seguinos en Instagram!" se desvanece sola a los 8 segundos
+// (el CSS de .ig-tooltip.oculta hace la transición).
+setTimeout(function(){
+  var tip = document.querySelector('.ig-tooltip');
+  if (tip) tip.classList.add('oculta');
+}, 8000);
 </script>
 </body></html>
