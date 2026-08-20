@@ -426,6 +426,96 @@ app.post('/admin/pedidos/:pedidoId/completar', requireAdmin, async (req, res) =>
 // propio de tamaño de payload/UX.
 const MAX_ITEMS_CARRITO = 10;
 
+// ── Precios: fuente de verdad del servidor ───────────────────────────────────
+// Espejo de PRECIOS y ZONAS_ENTREGA de index.html. Están duplicados a
+// propósito: antes el backend aceptaba el subtotal y el costo de envío que
+// mandaba el navegador y solo verificaba que fueran números positivos, así
+// que cualquiera podía editar el payload y pagar $1 por un pedido de
+// $20.000. Ahora el servidor recalcula ambos y descarta lo que le manda el
+// cliente. IMPORTANTE: si se cambia un precio en index.html hay que
+// cambiarlo también acá, o el cobro no va a coincidir con lo que ve el
+// cliente en pantalla (el servidor manda, así que cobraría el de acá).
+const PRECIOS = {
+  hoja: {
+    bn:    { una: 150, doble: 270 },
+    color: { una: 330, doble: 600 },
+  },
+  acabado: { suelto: 0, abrochado: 120, anillado: 2000, encuadernado: 1800 },
+};
+
+const ZONAS_ENTREGA = {
+  '1':  { name: 'Zona 1 (Centro)',    precio: 3000 },
+  '2':  { name: 'Zona 2',             precio: 3300 },
+  '3':  { name: 'Zona 3',             precio: 2500 },
+  '4':  { name: 'Zona 4',             precio: 1500 },
+  'ov': { name: 'Oro Verde',          precio: 3500 },
+  'sb': { name: 'San Benito',         precio: 3300 },
+  'ca': { name: 'Colonia Avellaneda', precio: 3700 },
+  'pe-terminal': { name: 'Punto de Encuentro — Terminal de Ómnibus', precio: 1500 },
+  'pe-uner':     { name: 'Punto de Encuentro — UNER Oro Verde',      precio: 1500 },
+  'pe-plaza':    { name: 'Punto de Encuentro — Plaza San Miguel',    precio: 1500 },
+};
+
+// Tope defensivo de hojas por ítem. No es un límite de negocio: existe solo
+// para que un payload absurdo no genere una preferencia de MP disparatada.
+const MAX_HOJAS_POR_ITEM = 5000;
+
+// Recalcula el subtotal de impresión de un ítem con la MISMA fórmula que
+// calcularPedido() en el front:  (hojas × precioPorHoja + acabado) × copias
+//
+// Qué se recalcula y qué no:
+//   - precioPorHoja y acabado salen de PRECIOS de acá (el cliente no manda precio).
+//   - copies se re-acota a 1..999, igual que el front.
+//   - hojas SÍ viene del cliente: depende de la cantidad de páginas de cada
+//     PDF, que el server cuenta en /procesar-archivo pero hoy no persiste, así
+//     que en /checkout no tiene con qué verificarlo. Se valida que sea un
+//     entero razonable. Cerrar del todo ese hueco requiere guardar las páginas
+//     por archivo al procesarlo — queda pendiente y está anotado.
+//
+// Devuelve { ok:true, subtotal, precioPorHoja, acabPrice } o { ok:false, error }.
+function calcularImpresionServer(p) {
+  const cfg = p && p.config;
+  if (!cfg || typeof cfg !== 'object') {
+    return { ok: false, error: 'Falta la configuración de uno de los pedidos' };
+  }
+
+  const tabla = PRECIOS.hoja[cfg.tinta];
+  const precioPorHoja = tabla && tabla[cfg.cara];
+  if (typeof precioPorHoja !== 'number') {
+    return { ok: false, error: 'La configuración de impresión no es válida' };
+  }
+
+  if (!Object.prototype.hasOwnProperty.call(PRECIOS.acabado, cfg.acabado)) {
+    return { ok: false, error: 'El acabado elegido no es válido' };
+  }
+
+  // Anillado "individual" cobra un anillado por archivo; el resto de los
+  // acabados (y el anillado "agrupado") cobran uno solo. Igual que el front.
+  let cantidadAnillados = 1;
+  if (cfg.acabado === 'anillado' && cfg.encuadernacion === 'individual') {
+    cantidadAnillados = Array.isArray(p.archivos) && p.archivos.length > 0
+      ? p.archivos.length
+      : 1;
+  }
+  const acabPrice = PRECIOS.acabado[cfg.acabado] * cantidadAnillados;
+
+  const hojas = Number(p.hojas);
+  if (!Number.isInteger(hojas) || hojas < 1 || hojas > MAX_HOJAS_POR_ITEM) {
+    return { ok: false, error: 'La cantidad de hojas del pedido no es válida' };
+  }
+
+  const copiesRaw = parseInt(p.copies, 10);
+  const copies = Math.max(1, Math.min(999, Number.isNaN(copiesRaw) ? 1 : copiesRaw));
+
+  return {
+    ok: true,
+    subtotal: (hojas * precioPorHoja + acabPrice) * copies,
+    precioPorHoja,
+    acabPrice,
+    copies,
+  };
+}
+
 // Reparte un descuento entre varios ítems, proporcional al peso de cada
 // uno en el subtotal combinado. El ÚLTIMO ítem absorbe el resto exacto
 // (evita drift de redondeo: la suma siempre da subtotalImpTotal - descuento).
@@ -445,7 +535,7 @@ function distribuirDescuento(pedidos, descuentoTotal, subtotalImpTotal) {
 }
 
 app.post('/checkout', async (req, res) => {
-  const { pedidoGrupoId, pedidos, zona, direccion, costoEnvio, email, whatsapp, codigo, fbp, fbc } = req.body;
+  const { pedidoGrupoId, pedidos, zona, zonaId, direccion, costoEnvio, email, whatsapp, codigo, fbp, fbc } = req.body;
 
   if (!pedidoGrupoId || !email) {
     return res.status(400).json({ error: 'pedidoGrupoId y email son obligatorios' });
@@ -456,13 +546,57 @@ app.post('/checkout', async (req, res) => {
   if (pedidos.length > MAX_ITEMS_CARRITO) {
     return res.status(400).json({ error: `Un mismo pago admite hasta ${MAX_ITEMS_CARRITO} pedidos` });
   }
+  // ── Precios: se recalculan acá, NUNCA se toman del cliente ───────────────
+  // El navegador sigue mandando subtotalImp y costoEnvio (los usa para su
+  // propia UI), pero acá se descartan y se vuelven a calcular desde PRECIOS
+  // y ZONAS_ENTREGA. Si no coinciden, manda el del servidor y se loguea:
+  // puede ser un intento de manipular el pago o un precio desincronizado
+  // entre index.html y este archivo.
+  const subtotalesServer = [];
   for (const p of pedidos) {
-    if (!p.pedidoId || typeof p.subtotalImp !== 'number' || p.subtotalImp <= 0) {
+    if (!p.pedidoId) {
       return res.status(400).json({ error: 'Uno de los pedidos del carrito es inválido' });
     }
+    const calc = calcularImpresionServer(p);
+    if (!calc.ok) {
+      return res.status(400).json({ error: calc.error });
+    }
+    if (typeof p.subtotalImp === 'number' && p.subtotalImp !== calc.subtotal) {
+      console.warn(
+        `⚠️  Subtotal recalculado | pedido=${p.pedidoId} | cliente=${p.subtotalImp} | servidor=${calc.subtotal} — se cobra el del servidor`,
+      );
+    }
+    subtotalesServer.push(calc);
   }
-  const envio = typeof costoEnvio === 'number' && costoEnvio >= 0 ? costoEnvio : 0;
-  const subtotalImpTotal = pedidos.reduce((acc, p) => acc + p.subtotalImp, 0);
+  // Se trabaja sobre una copia con los importes ya corregidos, para que todo
+  // lo que sigue (descuento, ítems de MP, filas de la base) use los valores
+  // del servidor y no los del navegador.
+  const pedidosValidados = pedidos.map((p, i) => ({
+    ...p,
+    subtotalImp:   subtotalesServer[i].subtotal,
+    precioPorHoja: subtotalesServer[i].precioPorHoja,
+    acabPrice:     subtotalesServer[i].acabPrice,
+    copies:        subtotalesServer[i].copies,
+  }));
+
+  // Envío: se resuelve por zonaId contra la tabla del servidor. El fallback
+  // por nombre cubre una pestaña vieja abierta antes de este cambio, que
+  // todavía no manda zonaId.
+  let zonaResuelta = zonaId ? ZONAS_ENTREGA[zonaId] : null;
+  if (!zonaResuelta && zona && zona.name) {
+    zonaResuelta = Object.values(ZONAS_ENTREGA).find(z => z.name === zona.name) || null;
+  }
+  if (!zonaResuelta) {
+    return res.status(400).json({ error: 'La zona de entrega no es válida' });
+  }
+  const envio = zonaResuelta.precio;
+  if (typeof costoEnvio === 'number' && costoEnvio !== envio) {
+    console.warn(
+      `⚠️  Envío recalculado | grupo=${pedidoGrupoId} | cliente=${costoEnvio} | servidor=${envio} — se cobra el del servidor`,
+    );
+  }
+
+  const subtotalImpTotal = subtotalesServer.reduce((acc, c) => acc + c.subtotal, 0);
   const totalBase = subtotalImpTotal + envio;
 
   // ── Código promocional: validar y calcular descuento SERVER-SIDE ─────────
@@ -517,7 +651,7 @@ app.post('/checkout', async (req, res) => {
   }
 
   const totalParaPago = Math.max(0, totalBase - descuentoServer);
-  const preciosConDescuento = distribuirDescuento(pedidos, descuentoServer, subtotalImpTotal);
+  const preciosConDescuento = distribuirDescuento(pedidosValidados, descuentoServer, subtotalImpTotal);
 
   const baseUrl = process.env.APP_BASE_URL;
   console.log(`📦 Creando preferencia MP | pedidoGrupoId=${pedidoGrupoId} | ${pedidos.length} ítem(s) | total=${totalParaPago}`);
@@ -526,9 +660,9 @@ app.post('/checkout', async (req, res) => {
   // (MP soporta items[] múltiples nativamente) + uno de envío si corresponde.
   let mpPreference;
   try {
-    const mpItems = pedidos.map((p, i) => ({
+    const mpItems = pedidosValidados.map((p, i) => ({
       id:          p.pedidoId,
-      title:       pedidos.length > 1 ? `Impresión ${i + 1}/${pedidos.length} — Punto Color` : 'Impresión en Punto Color',
+      title:       pedidosValidados.length > 1 ? `Impresión ${i + 1}/${pedidosValidados.length} — Punto Color` : 'Impresión en Punto Color',
       description: `${p.hojas ?? '?'} hoja(s) · ${p.config?.tinta ?? ''} · ${p.config?.acabado ?? ''}`,
       quantity:    1,
       unit_price:  preciosConDescuento[i],
@@ -582,7 +716,9 @@ app.post('/checkout', async (req, res) => {
     ua:  limpiarTrack(req.get('user-agent')),
   };
 
-  const filas = pedidos.map(p => ({
+  // pedidosValidados y no pedidos: así subtotal_imp guardado en la base es el
+  // que realmente se cobró (el del servidor), no el que mandó el navegador.
+  const filas = pedidosValidados.map(p => ({
     pedido_id:        p.pedidoId,
     pedido_grupo_id:  pedidoGrupoId,
     estado:           'pendiente',

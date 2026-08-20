@@ -85,8 +85,14 @@
 .zp{
   fill:transparent;
   stroke:transparent;
-  cursor:default;
-  pointer-events:none;
+  cursor:pointer;
+  /* 'all' y no 'auto': con fill transparente, visiblePainted no capta el
+     clic de forma consistente entre navegadores. */
+  pointer-events:all;
+  transition:fill .15s;
+}
+.zp:hover{
+  fill:rgba(255,255,255,0.18);
 }
 .zp.selected{
   fill:rgba(255,255,255,0.32);
@@ -176,6 +182,10 @@
 .zsl-item[data-id="sb"] .zsl-dot{background:#9b5de5}
 .zsl-item[data-id="ca"] .zsl-dot{background:#f5a623}
 .zsl-dot-pe{background:#4a2e0a}
+.zsl-pe-badge{
+  font-size:.62rem;font-weight:800;letter-spacing:.03em;text-transform:uppercase;
+  background:#2ec4b6;color:#fff;padding:2px 7px;border-radius:100px;white-space:nowrap;
+}
 .zsl-pe-toggle .zsl-chevron{margin-left:auto;transition:transform .2s;color:var(--soft)}
 .zsl-pe-toggle.open .zsl-chevron{transform:rotate(180deg)}
 .zsl-pe-sublista{display:none;padding-left:14px}
@@ -1935,8 +1945,8 @@ const PRECIOS = {
   // "Tamaño"). Si en el futuro se reactivan A5/Oficio, hay que agregar
   // sus precios reales acá antes de habilitar esos chips.
   hoja:{
-    bn:    { una:100, doble:180 },
-    color: { una:220, doble:400 }
+    bn:    { una:150, doble:270 },
+    color: { una:330, doble:600 }
   },
   // Costo de terminación (no depende de tinta, tamaño ni cara).
   // Sólo "anillado" tiene precio nuevo confirmado ($2.000). "abrochado"
@@ -2583,13 +2593,13 @@ function addToCart(){
 
 // ══ ZONA DE ENTREGA ══
 const ZONAS_ENTREGA = {
-  '1':  {name:'Zona 1 (Centro)',     precio:3500},
-  '2':  {name:'Zona 2',              precio:3800},
-  '3':  {name:'Zona 3',              precio:3000},
-  '4':  {name:'Zona 4',              precio:2000},
-  'ov': {name:'Oro Verde',           precio:4000},
-  'sb': {name:'San Benito',          precio:3800},
-  'ca': {name:'Colonia Avellaneda',  precio:4200},
+  '1':  {name:'Zona 1 (Centro)',     precio:3000},
+  '2':  {name:'Zona 2',              precio:3300},
+  '3':  {name:'Zona 3',              precio:2500},
+  '4':  {name:'Zona 4',              precio:1500},
+  'ov': {name:'Oro Verde',           precio:3500},
+  'sb': {name:'San Benito',          precio:3300},
+  'ca': {name:'Colonia Avellaneda',  precio:3700},
   'pe-terminal': {name:'Punto de Encuentro — Terminal de Ómnibus',  precio:1500},
   'pe-uner':     {name:'Punto de Encuentro — UNER Oro Verde',       precio:1500},
   'pe-plaza':    {name:'Punto de Encuentro — Plaza San Miguel',     precio:1500},
@@ -2664,9 +2674,32 @@ function cerrarZonas(){
 
 let mapaInited = false;
 function initMapaInteraction(){
-  // Interacción deshabilitada en el mapa.
-  // La selección se hace únicamente desde la lista de zonas.
+  // El mapa es seleccionable igual que la lista: la pantalla dice "tocá tu
+  // zona en el mapa", así que tiene que responder. Antes los paths tenían
+  // pointer-events:none y el clic no hacía nada — el visitante seguía la
+  // instrucción, no pasaba nada, y abandonaba ahí.
+  if (mapaInited) return;   // abrirZonas() llama a esta función cada vez
+  document.querySelectorAll('#zs-svg .zp[data-id]').forEach(function(path){
+    path.addEventListener('click', function(){
+      const id = path.dataset.id;
+      if (!ZONAS_ENTREGA[id]) return;
+      seleccionarZona(id);
+      _desbloquearCalleSiHaceFalta();
+    });
+  });
   mapaInited = true;
+}
+
+// Si venía elegido un punto de encuentro, el campo "calle y altura" quedó
+// con la dirección fija y en readOnly. Al pasar a una zona real hay que
+// liberarlo y vaciarlo, si no se guardaría "Terminal de Ómnibus..." como
+// si fuera la casa del cliente. Misma lógica que el listener delegado de
+// la lista — extraída acá para que el mapa haga exactamente lo mismo.
+function _desbloquearCalleSiHaceFalta(){
+  const calleInput = document.getElementById('addr-calle');
+  if (!calleInput) return;
+  if (calleInput.readOnly) calleInput.value = '';
+  calleInput.readOnly = false;
 }
 
 
@@ -2930,7 +2963,12 @@ function poblarResumen(){
     total:r.total, totalSinDescuento:r.totalSinDescuento,
     descuento:r.descuento, codigo: codigoPromoActual ? codigoPromoActual.codigo : null,
     pagesUnknown:r.pagesUnknown, subtotalImp:r.totalImpresion, subtotalEnv:r.costoEnvio,
-    zona, copies:r.copies, pages:r.pages, hojas:r.hojas,
+    // zona es el objeto {name, precio} para mostrar y guardar; zonaId es la
+    // clave de ZONAS_ENTREGA, y es lo que usa el backend para resolver el
+    // costo de envío por su cuenta en vez de confiar en el precio que
+    // manda el navegador (ver /checkout en server/index.js).
+    zona, zonaId: zonaSeleccionada,
+    copies:r.copies, pages:r.pages, hojas:r.hojas,
     precioPorHoja:r.precioPorHoja, acabPrice:r.acabPrice, carasImpresas:r.carasImpresas,
     config:{...config}, direccion:{...direccionEntrega},
     archivos:uploadedFiles.map(f=>f.name),
@@ -3183,7 +3221,8 @@ function confirmarPedido(){
             config: it.config, archivos: it.archivos,
           };
         }),
-        zona: primerItem.zona, direccion: primerItem.direccion,
+        zona: primerItem.zona, zonaId: primerItem.zonaId ?? null,
+        direccion: primerItem.direccion,
         costoEnvio: primerItem.subtotalEnv,
         email, whatsapp: wa, codigo: primerItem.codigo || null,
         fbp: _fbp || null, fbc: _fbc || null,
@@ -4002,7 +4041,7 @@ updateSummary();
     <button class="zs-back" onclick="cerrarZonas()">← Volver</button>
     <div class="zs-head-text">
       <div class="zs-title">Seleccioná tu zona de <em>entrega</em></div>
-      <div class="zs-sub">Elegí tu zona del mapa</div>
+      <div class="zs-sub">Tocá tu zona en el mapa o elegila de la lista</div>
     </div>
   </div>
 
@@ -4052,8 +4091,8 @@ updateSummary();
 <div class="zsl-item" data-id="ov" onclick="seleccionarZona('ov')"><span class="zsl-dot"></span><span class="zsl-name">Oro Verde</span><span class="zsl-precio"></span></div>
 <div class="zsl-item" data-id="sb" onclick="seleccionarZona('sb')"><span class="zsl-dot"></span><span class="zsl-name">San Benito</span><span class="zsl-precio"></span></div>
 <div class="zsl-item" data-id="ca" onclick="seleccionarZona('ca')"><span class="zsl-dot"></span><span class="zsl-name">Colonia Avellaneda</span><span class="zsl-precio"></span></div>
-<div class="zsl-item zsl-pe-toggle" onclick="togglePuntoEncuentro()"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Punto de Encuentro</span><span class="zsl-chevron">▾</span></div>
-<div class="zsl-pe-sublista" id="pe-sub-lista">
+<div class="zsl-item zsl-pe-toggle open" onclick="togglePuntoEncuentro()"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Punto de Encuentro</span><span class="zsl-pe-badge">Más económico</span><span class="zsl-chevron">▾</span></div>
+<div class="zsl-pe-sublista show" id="pe-sub-lista">
   <div class="zsl-item zsl-sub-item" data-id="pe-terminal" onclick="seleccionarPuntoEncuentro('pe-terminal')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Terminal de Ómnibus</span><span class="zsl-precio"></span><span class="zsl-horario">🕒 Martes y viernes 10:45 - 11:00hs</span></div>
   <div class="zsl-item zsl-sub-item" data-id="pe-uner" onclick="seleccionarPuntoEncuentro('pe-uner')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">UNER, Oro Verde</span><span class="zsl-precio"></span><span class="zsl-horario">🕒 Lunes y jueves 10:45 - 11:00hs</span></div>
   <div class="zsl-item zsl-sub-item" data-id="pe-plaza" onclick="seleccionarPuntoEncuentro('pe-plaza')"><span class="zsl-dot zsl-dot-pe"></span><span class="zsl-name">Plaza San Miguel</span><span class="zsl-precio"></span><span class="zsl-horario">🕒 Miércoles 10:45 - 11:00hs</span></div>
