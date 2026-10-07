@@ -861,6 +861,31 @@ main{
 @keyframes toast-in{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:translateY(0)}}
 @keyframes toast-out{to{opacity:0;transform:translateY(-10px)}}
 
+/* Ayuda por WhatsApp ante un error de subida: va dentro de #toast-host,
+   debajo del cartel de error. #toast-host tiene pointer-events:none, así
+   que la tarjeta lo reactiva para que el botón y la ✕ se puedan tocar.
+   Ancho explícito: #toast-host está en left:50% y sin esto se achica a
+   la mitad de la pantalla en mobile. */
+.wa-ayuda{
+  pointer-events:auto;position:relative;box-sizing:border-box;
+  width:min(90vw,380px);padding:14px 36px;text-align:center;
+  background:var(--panel);color:var(--ink);
+  border:2px solid rgba(37,211,102,.6);border-radius:14px;
+  box-shadow:0 10px 30px rgba(0,0,0,.28);
+  animation:toast-in .3s ease-out;
+}
+.wa-ayuda-txt{font-family:'Nunito',sans-serif;font-weight:800;font-size:.9rem;line-height:1.35;margin-bottom:10px}
+.wa-ayuda-btn{
+  display:inline-block;background:#25D366;color:#fff;text-decoration:none;
+  font-family:'Fredoka One',sans-serif;font-size:.85rem;
+  padding:9px 18px;border-radius:30px;transition:background .15s;
+}
+.wa-ayuda-btn:hover{background:#1ebe5a}
+.wa-ayuda-cerrar{
+  position:absolute;top:6px;right:8px;padding:4px 6px;
+  background:none;border:none;font-size:.95rem;line-height:1;color:var(--soft);
+}
+
 /* ── Mascota estática ── */
 #mascot-img{
   width:453px;height:auto;
@@ -2062,17 +2087,50 @@ const convertedSet = new WeakSet();
 
 // ══ TOAST ══
 let toastHost = null;
-function showToast(msg, type){
+function _getToastHost(){
   if(!toastHost){
     toastHost = document.createElement('div');
     toastHost.id = 'toast-host';
     document.body.appendChild(toastHost);
   }
+  return toastHost;
+}
+function showToast(msg, type){
   const t = document.createElement('div');
   t.className = type === 'success' ? 'toast success' : 'toast';
   t.textContent = msg;
-  toastHost.appendChild(t);
+  _getToastHost().appendChild(t);
   setTimeout(() => t.remove(), 5200);
+}
+
+// ══ AYUDA POR WHATSAPP ANTE ERRORES DE SUBIDA ══
+// Una sola tarjeta reutilizada: cada nuevo error la vuelve a poner al
+// final de #toast-host (debajo del último cartel) y reinicia su tiempo
+// en pantalla, así varios archivos fallidos no apilan varias tarjetas.
+let waAyudaEl = null, waAyudaTimer = null;
+function mostrarAyudaWhatsApp(){
+  if(!waAyudaEl){
+    waAyudaEl = document.createElement('div');
+    waAyudaEl.className = 'wa-ayuda';
+    waAyudaEl.innerHTML =
+      '<button type="button" class="wa-ayuda-cerrar" aria-label="Cerrar">✕</button>' +
+      '<div class="wa-ayuda-txt">¿Problemas al cargar tu archivo? ¡Envíanoslo por WhatsApp!</div>' +
+      '<a class="wa-ayuda-btn" target="_blank" rel="noopener">Abrir chat de WhatsApp</a>';
+    const btn = waAyudaEl.querySelector('.wa-ayuda-btn');
+    // Mensaje precargado: quien atiende ya sabe por qué le escriben.
+    btn.href = 'https://wa.me/5493436124797?text=' +
+      encodeURIComponent('¡Hola! Tuve problemas para subir mi archivo en la web, te lo mando por acá.');
+    btn.addEventListener('click', ocultarAyudaWhatsApp);
+    waAyudaEl.querySelector('.wa-ayuda-cerrar').addEventListener('click', ocultarAyudaWhatsApp);
+  }
+  _getToastHost().appendChild(waAyudaEl);  // si ya estaba, la mueve al final
+  waAyudaEl.hidden = false;
+  clearTimeout(waAyudaTimer);
+  waAyudaTimer = setTimeout(ocultarAyudaWhatsApp, 15000);
+}
+function ocultarAyudaWhatsApp(){
+  clearTimeout(waAyudaTimer);
+  if(waAyudaEl) waAyudaEl.hidden = true;
 }
 
 function addFile(file){
@@ -2428,6 +2486,9 @@ function updateSummary(){
   const warnEl = document.getElementById('sm-pages-warn');
   if (r.pagesUnknown){
     document.getElementById('sm-pages').textContent = 'No se pudo determinar';
+    // Solo en la transición oculto -> visible: updateSummary() corre ante
+    // cada cambio de configuración y la ayuda no debe reaparecer cada vez.
+    if (warnEl && !warnEl.classList.contains('show')) mostrarAyudaWhatsApp();
     if (warnEl) warnEl.classList.add('show');
   } else {
     document.getElementById('sm-pages').textContent = r.hojas > 0 ? r.hojas : '—';
@@ -2540,6 +2601,7 @@ function processFiles(files){
         processed.push(result.file);
       } catch(err){
         showToast(err.message || ('No se pudo procesar ' + f.name));
+        mostrarAyudaWhatsApp();
       }
     }
 
