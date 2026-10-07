@@ -194,6 +194,11 @@ function chipsSpecs(p){
   // tinta color y copias extra son los dos descuidos más caros al armar
   if (config.tinta)   chips.push({ txt: config.tinta,               destacar: config.tinta === 'color' });
   if (config.cara)    chips.push({ txt: config.cara,                destacar: false });
+  // Solo se muestra cuando NO es el valor por defecto ('1' = Normal):
+  // poner 2 páginas por cara cambia por completo cómo se arma el
+  // documento y es muy fácil pasarlo por alto. Es "por cara", no por
+  // hoja: con doble faz son 2 por cara = 4 por hoja.
+  if (String(config.ppc) === '2') chips.push({ txt: '2 págs por cara', destacar: true });
   if (config.acabado) chips.push({ txt: config.acabado,             destacar: false });
   if (p.copies)       chips.push({ txt: `${p.copies} copia(s)`,     destacar: Number(p.copies) > 1 });
   if (p.hojas)        chips.push({ txt: `${p.hojas} hoja(s)`,       destacar: false });
