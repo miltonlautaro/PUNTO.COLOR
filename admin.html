@@ -188,17 +188,32 @@ async function cargarPedidos(){
   }
 }
 
+// ¿El "2 páginas por cara" que eligió el cliente tiene algún efecto real?
+// Cada archivo arranca en una hoja nueva, así que con archivos de una sola
+// página no junta nada ni abarata: pages > cantidad de archivos significa
+// que al menos uno tiene 2+ páginas. Si no sabemos las páginas, devolvemos
+// true para no ocultarle al operador un 2-up que sí es real.
+function aplicaDosPorCara(p){
+  if (p.pages == null) return true;
+  const archivos = Array.isArray(p.archivos) ? p.archivos.length : 1;
+  return Number(p.pages) > archivos;
+}
+
 function chipsSpecs(p){
   const config = p.config || {};
   const chips = [];
   // tinta color y copias extra son los dos descuidos más caros al armar
   if (config.tinta)   chips.push({ txt: config.tinta,               destacar: config.tinta === 'color' });
   if (config.cara)    chips.push({ txt: config.cara,                destacar: false });
-  // Solo se muestra cuando NO es el valor por defecto ('1' = Normal):
-  // poner 2 páginas por cara cambia por completo cómo se arma el
-  // documento y es muy fácil pasarlo por alto. Es "por cara", no por
-  // hoja: con doble faz son 2 por cara = 4 por hoja.
-  if (String(config.ppc) === '2') chips.push({ txt: '2 págs por cara', destacar: true });
+  // 2 páginas por cara cambia por completo cómo se arma el documento, pero
+  // solo se muestra cuando REALMENTE se aplica. Cada archivo arranca en una
+  // hoja nueva, así que si todos tienen una sola página la opción queda
+  // inerte (ni junta páginas ni cambia el precio) y mostrarla confunde.
+  // pages > cantidad de archivos  =>  al menos un archivo tiene 2+ páginas.
+  // Es "por cara", no por hoja: con doble faz son 2 por cara = 4 por hoja.
+  if (String(config.ppc) === '2' && aplicaDosPorCara(p)) {
+    chips.push({ txt: '2 págs por cara', destacar: true });
+  }
   if (config.acabado) chips.push({ txt: config.acabado,             destacar: false });
   if (p.copies)       chips.push({ txt: `${p.copies} copia(s)`,     destacar: Number(p.copies) > 1 });
   if (p.hojas)        chips.push({ txt: `${p.hojas} hoja(s)`,       destacar: false });
