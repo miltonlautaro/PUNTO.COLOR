@@ -695,7 +695,9 @@ app.post('/admin/limpiar-constancias', async (req, res) => {
 // ── Códigos promocionales: administración desde el panel ─────────────────────
 // Se valida con rigor al crear porque /checkout aplica el porcentaje sin tope:
 // un valor mal cargado (ej. 150%) descuadraría el cobro.
-const TIPOS_CODIGO = ['porcentaje', 'monto'];
+// Los valores los impone un CHECK de la base (codigos_promocionales_tipo_check):
+// solo acepta 'porcentaje' o 'fijo'. Cualquier otro valor la hace fallar.
+const TIPOS_CODIGO = ['porcentaje', 'fijo'];
 
 app.get('/admin/codigos', requireAdmin, async (req, res) => {
   const { data: codigos, error } = await supabase
@@ -726,7 +728,7 @@ app.post('/admin/codigos', requireAdmin, async (req, res) => {
     return res.status(400).json({ error: 'El código debe tener entre 3 y 32 caracteres, solo letras y números.' });
   }
   if (!TIPOS_CODIGO.includes(tipo)) {
-    return res.status(400).json({ error: 'El tipo tiene que ser "porcentaje" o "monto".' });
+    return res.status(400).json({ error: 'El tipo tiene que ser "porcentaje" o "fijo".' });
   }
   if (!Number.isFinite(valor) || valor <= 0) {
     return res.status(400).json({ error: 'El valor tiene que ser un número mayor a 0.' });
@@ -817,6 +819,11 @@ const ZONAS_ENTREGA = {
 // Tope defensivo de hojas por ítem. No es un límite de negocio: existe solo
 // para que un payload absurdo no genere una preferencia de MP disparatada.
 const MAX_HOJAS_POR_ITEM = 5000;
+
+// Beneficio para alumnos con constancia aprobada vigente. Está replicado en
+// index.html (buscar DESCUENTO_ESTUDIANTE_PCT): si se cambia acá hay que
+// cambiarlo allá, o la pantalla mostraría un total distinto al que se cobra.
+const DESCUENTO_ESTUDIANTE_PCT = 20;
 
 // Recalcula el subtotal de impresión de un ítem con la MISMA fórmula que
 // calcularPedido() en el front:  (hojas × precioPorHoja + acabado) × copias
@@ -957,22 +964,42 @@ app.post('/checkout', async (req, res) => {
   const subtotalImpTotal = subtotalesServer.reduce((acc, c) => acc + c.subtotal, 0);
   const totalBase = subtotalImpTotal + envio;
 
-  // ── Código promocional: validar y calcular descuento SERVER-SIDE ─────────
-  // Nunca se confía en ningún total/descuento que mande el cliente. El
-  // descuento se aplica UNA sola vez sobre el subtotal de impresión
-  // COMBINADO de todos los ítems del carrito (nunca sobre el envío, y
-  // nunca por ítem individual).
+  // ── Descuentos: código promocional y beneficio de estudiante ─────────────
+  // Nunca se confía en ningún total/descuento que mande el cliente. Los dos
+  // descuentos se calculan sobre el subtotal de impresión COMBINADO de todos
+  // los ítems del carrito (nunca sobre el envío) y NO se acumulan: se aplica
+  // el MAYOR de los dos. Esa regla es la que hace imposible que el descuento
+  // supere al total y descuadre lo que se le cobra en Mercado Pago.
   let descuentoServer = 0;
   let userId = null;
 
-  if (codigo) {
-    const authHeader = req.headers['authorization'] || '';
-    const token = authHeader.replace('Bearer ', '').trim();
-    if (!token) return res.status(401).json({ error: 'Se requiere sesión para usar un código' });
-
+  // Se identifica al usuario siempre que mande sesión, no solo cuando usa un
+  // código: el beneficio de estudiante depende de quién es, no de que escriba
+  // nada. La compra como invitado sigue permitida (sin token, sin beneficio).
+  const authHeader = req.headers['authorization'] || '';
+  const token = authHeader.replace('Bearer ', '').trim();
+  if (token) {
     const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
     if (authErr || !user) return res.status(401).json({ error: 'Sesión inválida' });
     userId = user.id;
+  }
+
+  // Beneficio de estudiante: constancia aprobada y todavía vigente.
+  let descuentoEstudiante = 0;
+  if (userId) {
+    const beneficio = await beneficioEstudianteVigente(userId);
+    if (beneficio.activo) {
+      descuentoEstudiante = Math.min(
+        Math.round(subtotalImpTotal * DESCUENTO_ESTUDIANTE_PCT / 100),
+        subtotalImpTotal,
+      );
+    }
+  }
+
+  // Código promocional
+  let descuentoCodigo = 0;
+  if (codigo) {
+    if (!userId) return res.status(401).json({ error: 'Se requiere sesión para usar un código' });
 
     const { data: codigoData, error: codigoErr } = await supabase
       .from('codigos_promocionales')
@@ -985,15 +1012,25 @@ app.post('/checkout', async (req, res) => {
       return res.status(400).json({ error: 'Código inválido o inactivo' });
     }
 
-    if (codigoData.tipo === 'porcentaje') {
-      descuentoServer = Math.round(subtotalImpTotal * codigoData.valor / 100);
-    } else {
-      descuentoServer = Math.min(Number(codigoData.valor), subtotalImpTotal);
-    }
+    descuentoCodigo = codigoData.tipo === 'porcentaje'
+      // El Math.min le faltaba a esta rama: un código cargado con más de 100%
+      // habría descontado más que el subtotal de impresión.
+      ? Math.min(Math.round(subtotalImpTotal * codigoData.valor / 100), subtotalImpTotal)
+      : Math.min(Number(codigoData.valor), subtotalImpTotal);
+  }
 
-    // Registrar uso ANTES de crear la preferencia MP, UNA sola vez para
-    // todo el carrito (pedido_id = pedidoGrupoId, no un ítem individual).
-    // Si la restricción UNIQUE (user_id, codigo) falla → código ya usado → rechazar.
+  // El mayor de los dos, nunca la suma. En caso de empate gana el beneficio,
+  // así el código le queda al cliente para otra compra.
+  const ganaCodigo = descuentoCodigo > descuentoEstudiante;
+  descuentoServer = Math.max(descuentoCodigo, descuentoEstudiante);
+  const codigoAplicado = ganaCodigo ? codigo : null;
+
+  // El uso se registra SOLO si el código es el que terminó aplicándose: si el
+  // beneficio de estudiante era mejor, no se le quema un código que no usó.
+  if (ganaCodigo) {
+    // Antes de crear la preferencia de MP, UNA sola vez para todo el carrito
+    // (pedido_id = pedidoGrupoId). Si el UNIQUE (user_id, codigo) falla, el
+    // código ya se había usado → se rechaza.
     const { error: usoErr } = await supabase
       .from('codigos_usados')
       .insert({ user_id: userId, codigo, pedido_id: pedidoGrupoId });
@@ -1004,8 +1041,10 @@ app.post('/checkout', async (req, res) => {
         error: yaUsado ? 'Este código ya fue utilizado en otro pedido' : 'No se pudo registrar el código',
       });
     }
+  }
 
-    console.log(`🏷️  Código ${codigo} aplicado | descuento server-side: $${descuentoServer}`);
+  if (descuentoServer > 0) {
+    console.log(`🏷️  Descuento aplicado: $${descuentoServer} (${ganaCodigo ? 'código ' + codigo : 'beneficio de estudiante'})`);
   }
 
   const totalParaPago = Math.max(0, totalBase - descuentoServer);
@@ -1098,7 +1137,9 @@ app.post('/checkout', async (req, res) => {
     archivos:         p.archivos       ?? null,
     email,
     whatsapp:         whatsapp         ?? null,
-    codigo_promo:     codigo           ?? null,
+    // Solo si el código fue el descuento que ganó. Si quedó en null pero hay
+    // descuento, fue el beneficio de estudiante.
+    codigo_promo:     codigoAplicado   ?? null,
   }));
 
   const { ok: insertOk, error: dbError } = await insertarPedidosConReintento(filas);

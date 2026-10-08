@@ -2411,15 +2411,11 @@ function calcularPedido(){
   // queda en null, y cada pantalla decide cómo avisarlo.
   const totalSinDescuento = pagesUnknown ? null : (totalImpresion + costoEnvio);
 
-  // Descuento por código promocional — única fuente de verdad del descuento.
-  // Todas las pantallas y validaciones lo obtienen de acá vía calcularPedido().
+  // Descuento (código o beneficio de estudiante, el mayor de los dos) — ver
+  // calcularDescuento(), que replica la fórmula del servidor.
   let descuento = 0;
-  if (codigoPromoActual && totalSinDescuento !== null) {
-    if (codigoPromoActual.tipo === 'porcentaje') {
-      descuento = Math.round(totalImpresion * codigoPromoActual.valor / 100);
-    } else {
-      descuento = Math.min(Number(codigoPromoActual.valor), totalImpresion);
-    }
+  if (totalSinDescuento !== null) {
+    descuento = calcularDescuento(totalImpresion).monto;
   }
   const total = totalSinDescuento !== null ? Math.max(0, totalSinDescuento - descuento) : null;
 
@@ -2702,6 +2698,35 @@ const PUNTOS_ENCUENTRO_DIRECCION = {
 let zonaSeleccionada = null;
 var codigoPromoActual = null; // { codigo, tipo, valor } | null — leído en calcularPedido()
 
+// Beneficio de estudiante. Lo resuelve el servidor (GET /constancia/mia) y acá
+// solo se guarda para poder mostrar el total correcto: el descuento real lo
+// vuelve a calcular el backend en /checkout, nunca se confía en esto.
+// El porcentaje está replicado en server/index.js (DESCUENTO_ESTUDIANTE_PCT):
+// si cambia uno hay que cambiar el otro.
+var DESCUENTO_ESTUDIANTE_PCT = 20;
+var beneficioEstudiante = { activo:false, venceAt:null };
+
+// Única fórmula de descuento del frontend, calcada de la del servidor: el
+// código y el beneficio NO se suman, se aplica el mayor, siempre sobre la
+// impresión (el envío nunca se descuenta). La usan las dos pantallas que
+// muestran importes, para que ninguna muestre un total distinto al cobrado.
+function calcularDescuento(subtotalImp){
+  if (!(subtotalImp > 0)) return { monto: 0, origen: null };
+
+  var porCodigo = 0;
+  if (codigoPromoActual) {
+    porCodigo = codigoPromoActual.tipo === 'porcentaje'
+      ? Math.min(Math.round(subtotalImp * codigoPromoActual.valor / 100), subtotalImp)
+      : Math.min(Number(codigoPromoActual.valor), subtotalImp);
+  }
+  var porEstudiante = beneficioEstudiante.activo
+    ? Math.min(Math.round(subtotalImp * DESCUENTO_ESTUDIANTE_PCT / 100), subtotalImp)
+    : 0;
+
+  if (porCodigo > porEstudiante) return { monto: porCodigo, origen: 'codigo' };
+  return { monto: porEstudiante, origen: porEstudiante > 0 ? 'estudiante' : null };
+}
+
 // ── Carrito: pedidos "guardados" pendientes de pago conjunto ────────────────
 // Cada elemento es una foto de window._pedidoData en el momento de guardar.
 // Persiste en sessionStorage (sobrevive un F5, se pierde al cerrar la
@@ -2976,12 +3001,9 @@ function poblarResumen(){
   const subtotalImpCombinado = subtotalImpCarrito + (documentoListo ? r.totalImpresion : 0);
   const costoEnvioCombinado = carritoPedidos.length > 0 ? carritoPedidos[0].subtotalEnv : r.costoEnvio;
 
-  let descuentoCombinado = 0;
-  if (codigoPromoActual && subtotalImpCombinado > 0) {
-    descuentoCombinado = codigoPromoActual.tipo === 'porcentaje'
-      ? Math.round(subtotalImpCombinado * codigoPromoActual.valor / 100)
-      : Math.min(Number(codigoPromoActual.valor), subtotalImpCombinado);
-  }
+  // Mismo criterio que el servidor sobre el subtotal de TODO el carrito.
+  const descuentoInfo = calcularDescuento(subtotalImpCombinado);
+  const descuentoCombinado = descuentoInfo.monto;
   const totalCombinado = Math.max(0, subtotalImpCombinado + costoEnvioCombinado - descuentoCombinado);
   const totalAConfirmar = hayDocumentoEnCurso && r.pagesUnknown;
 
@@ -3000,9 +3022,14 @@ function poblarResumen(){
   var descRow = document.getElementById('rs-descuento-row');
   if (descRow) {
     if (descuentoCombinado > 0 && !totalAConfirmar) {
-      var lbl = codigoPromoActual
-        ? '🏷️ ' + codigoPromoActual.codigo + (codigoPromoActual.tipo === 'porcentaje' ? ' (−' + codigoPromoActual.valor + '%)' : '')
-        : '🏷️ Descuento';
+      var lbl;
+      if (descuentoInfo.origen === 'estudiante') {
+        lbl = '🎓 Beneficio estudiante (−' + DESCUENTO_ESTUDIANTE_PCT + '%)';
+      } else if (codigoPromoActual) {
+        lbl = '🏷️ ' + codigoPromoActual.codigo + (codigoPromoActual.tipo === 'porcentaje' ? ' (−' + codigoPromoActual.valor + '%)' : '');
+      } else {
+        lbl = '🏷️ Descuento';
+      }
       document.getElementById('rs-descuento-lbl').textContent = lbl;
       document.getElementById('rs-descuento').textContent = '−' + fmt(descuentoCombinado);
       descRow.style.display = 'flex';
@@ -3156,7 +3183,28 @@ async function aplicarCodigoPromo() {
   }
 
   // Código válido — aplicar
-  codigoPromoActual = { codigo: codigoData.codigo, tipo: codigoData.tipo, valor: Number(codigoData.valor) };
+  var candidato = { codigo: codigoData.codigo, tipo: codigoData.tipo, valor: Number(codigoData.valor) };
+
+  // Si el beneficio de estudiante ya es mejor o igual, no se aplica: el
+  // servidor haría lo mismo (toma el mayor y no registra el uso del código),
+  // así que avisarlo acá evita que el cliente crea que lo gastó.
+  if (beneficioEstudiante.activo) {
+    var rEst = calcularPedido();
+    var subCarrito = carritoPedidos.reduce(function(acc,p){ return acc + (p.subtotalImp||0); }, 0);
+    var subImp = subCarrito + ((uploadedFiles.length > 0 && !rEst.pagesUnknown) ? rEst.totalImpresion : 0);
+
+    var anterior = codigoPromoActual;
+    codigoPromoActual = candidato;
+    var ganaElCodigo = calcularDescuento(subImp).origen === 'codigo';
+    codigoPromoActual = anterior;
+
+    if (!ganaElCodigo) {
+      _promoMsg('Tu beneficio de estudiante (' + DESCUENTO_ESTUDIANTE_PCT + '%) ya es mejor que este código, así que te dejamos el beneficio y el código sin usar.', 'ok');
+      return;
+    }
+  }
+
+  codigoPromoActual = candidato;
   updateSummary();
   _refreshResumenSiVisible();
   var descLabel = codigoData.tipo === 'porcentaje'
@@ -3312,7 +3360,13 @@ function confirmarPedido(){
         zona: primerItem.zona, zonaId: primerItem.zonaId ?? null,
         direccion: primerItem.direccion,
         costoEnvio: primerItem.subtotalEnv,
-        email, whatsapp: wa, codigo: primerItem.codigo || null,
+        // El código se lee EN VIVO, no del primer ítem del carrito: ese valor
+        // es una foto del momento en que se guardó ese ítem, así que si el
+        // cliente aplicaba el código después de agregar pedidos, la pantalla
+        // le mostraba el descuento y el servidor cobraba sin él (y al revés,
+        // si lo quitaba después, se le cobraba con descuento y se le quemaba
+        // el código).
+        email, whatsapp: wa, codigo: codigoPromoActual ? codigoPromoActual.codigo : null,
         fbp: _fbp || null, fbc: _fbc || null,
       }),
     });
@@ -4006,6 +4060,7 @@ async function acDoLogin() {
   }
   acSetErr('login-err', '');
   acUpdateNavBtn().catch(() => {});
+  acCargarBeneficio().catch(function(){});  // por si ya tiene el 20% activo
   var user = await acCurrentUser();
   if (user) acFillProfile(user);
   showPage('tienda');
@@ -4086,6 +4141,10 @@ async function acSaveProfile() {
 async function acLogout() {
   await window._supabase.auth.signOut();
   acUpdateNavBtn().catch(() => {});
+  // Sin sesión no hay beneficio: los importes vuelven a precio pleno.
+  beneficioEstudiante = { activo:false, venceAt:null };
+  if (typeof updateSummary === 'function') updateSummary();
+  if (typeof _refreshResumenSiVisible === 'function') _refreshResumenSiVisible();
   acShowState('ac-register');
 }
 
@@ -4109,6 +4168,27 @@ function _estMostrar(clase, texto) {
   caja.className = 'est-estado show ' + clase;
 }
 
+// Consulta el estado del beneficio y lo deja en la variable global para que
+// los importes de las pantallas lo reflejen. Se llama al cargar la página, al
+// iniciar sesión y cada vez que se entra a Mi cuenta.
+async function acCargarBeneficio() {
+  var token = await _estToken();
+  if (!token) { beneficioEstudiante = { activo:false, venceAt:null }; return null; }
+  try {
+    var res = await fetch(PC_SERVER + '/constancia/mia', { headers: { Authorization: 'Bearer ' + token } });
+    if (!res.ok) throw new Error('estado no disponible');
+    var data = await res.json();
+    beneficioEstudiante = data.beneficio || { activo:false, venceAt:null };
+    // Los importes ya mostrados tienen que actualizarse con el descuento.
+    if (typeof updateSummary === 'function') updateSummary();
+    if (typeof _refreshResumenSiVisible === 'function') _refreshResumenSiVisible();
+    return data;
+  } catch (e) {
+    beneficioEstudiante = { activo:false, venceAt:null };
+    return null;
+  }
+}
+
 async function acInitEstudiante() {
   var caja = document.getElementById('est-estado');
   var btn  = document.getElementById('est-btn');
@@ -4119,9 +4199,8 @@ async function acInitEstudiante() {
   if (!token) return;
 
   try {
-    var res = await fetch(PC_SERVER + '/constancia/mia', { headers: { Authorization: 'Bearer ' + token } });
-    if (!res.ok) throw new Error('estado no disponible');
-    var data = await res.json();
+    var data = await acCargarBeneficio();
+    if (!data) throw new Error('estado no disponible');
     var c = data.constancia;
     var beneficio = data.beneficio || {};
 
@@ -4224,6 +4303,7 @@ async function acAutofillEmail() {
 
 // ══ INIT ══
 acUpdateNavBtn().catch(() => {}); // async — fire and forget
+acCargarBeneficio().catch(() => {}); // si ya hay sesión, los precios salen con el 20%
 updateConditionalSections();
 updateSummary();
 </script>
