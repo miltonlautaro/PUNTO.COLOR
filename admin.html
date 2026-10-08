@@ -71,7 +71,37 @@
   }
   .completar-btn:disabled{opacity:.5;cursor:default}
 
-  #estado-carga, #estado-vacio{text-align:center;padding:60px 0;color:#7a5a2a}
+  /* Pestañas: el panel pasó de una sola vista a varias secciones */
+  .tabs{display:flex;gap:8px}
+  .toolbar-acciones{display:flex;gap:8px}
+  .tab-btn.active{background:var(--ink);color:#f5e8cf}
+
+  /* Códigos promocionales */
+  .estado-activo{background:#cdeee9;color:#166b62}
+  .estado-inactivo{background:#e8e2d6;color:#7a6a52}
+  .cod-form{background:#fff;border-radius:16px;padding:18px 20px;margin-bottom:18px;box-shadow:0 6px 20px rgba(26,16,9,.08)}
+  .cod-form-title{font-family:'Fredoka One',sans-serif;font-size:.95rem;margin-bottom:12px}
+  .cod-form-row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  .cod-form-row input,.cod-form-row select{
+    padding:9px 12px;border:1px solid #ddd;border-radius:10px;
+    font-family:'Nunito',sans-serif;font-size:.9rem;font-weight:700;
+  }
+  #cod-codigo{width:150px;text-transform:uppercase;letter-spacing:.04em}
+  #cod-valor{width:100px}
+  #cod-desc{flex:1;min-width:170px;font-weight:400}
+  .cod-msg{font-size:.82rem;font-weight:700;margin-top:10px;display:none}
+  .cod-msg.show{display:block}
+  .cod-msg.ok{color:var(--ok)}
+  .cod-msg.err{color:var(--accent)}
+  .cod-info{font-size:.85rem;line-height:1.6;color:#4a2e0a;margin-bottom:12px}
+  .cod-info strong{color:var(--ink)}
+  .desactivar-btn{
+    background:var(--accent);color:#fff;border:none;padding:8px 18px;border-radius:20px;
+    font-family:'Fredoka One',sans-serif;font-size:.8rem;cursor:pointer;
+  }
+  .desactivar-btn:disabled{opacity:.5;cursor:default}
+
+  #estado-carga, #estado-vacio, #codigos-carga, #codigos-vacio{text-align:center;padding:60px 0;color:#7a5a2a}
   #app{display:none}
 </style>
 </head>
@@ -90,12 +120,41 @@
 
   <div id="app">
     <div class="toolbar">
-      <button onclick="cargarPedidos()">↻ Actualizar</button>
-      <button onclick="logout()">Cerrar sesión</button>
+      <div class="tabs">
+        <button class="tab-btn active" id="tab-pedidos" onclick="mostrarSeccion('pedidos')">📦 Pedidos</button>
+        <button class="tab-btn" id="tab-codigos" onclick="mostrarSeccion('codigos')">🏷️ Códigos</button>
+      </div>
+      <div class="toolbar-acciones">
+        <button onclick="actualizarSeccion()">↻ Actualizar</button>
+        <button onclick="logout()">Cerrar sesión</button>
+      </div>
     </div>
-    <div id="estado-carga">Cargando pedidos...</div>
-    <div id="estado-vacio" style="display:none">No hay pedidos todavía.</div>
-    <div id="pedidos-list"></div>
+
+    <div id="sec-pedidos">
+      <div id="estado-carga">Cargando pedidos...</div>
+      <div id="estado-vacio" style="display:none">No hay pedidos todavía.</div>
+      <div id="pedidos-list"></div>
+    </div>
+
+    <div id="sec-codigos" hidden>
+      <div class="cod-form">
+        <div class="cod-form-title">Nuevo código promocional</div>
+        <div class="cod-form-row">
+          <input id="cod-codigo" placeholder="PROMO20" maxlength="32" autocomplete="off">
+          <select id="cod-tipo">
+            <option value="porcentaje">% de descuento</option>
+            <option value="monto">$ fijo</option>
+          </select>
+          <input id="cod-valor" type="number" min="1" placeholder="20">
+          <input id="cod-desc" placeholder="Descripción (opcional)" maxlength="80" autocomplete="off">
+          <button class="completar-btn" onclick="crearCodigo(this)">+ Crear</button>
+        </div>
+        <div class="cod-msg" id="cod-msg"></div>
+      </div>
+      <div id="codigos-carga">Cargando códigos...</div>
+      <div id="codigos-vacio" style="display:none">No hay códigos cargados.</div>
+      <div id="codigos-list"></div>
+    </div>
   </div>
 </main>
 
@@ -124,6 +183,43 @@ async function getToken(){
   return data?.session?.access_token || null;
 }
 
+// Fetch autenticado contra el panel. Si el servidor responde que la cuenta no
+// es admin, cierra la sesión y devuelve null — quien llama solo tiene que
+// cortar. El panel nunca lee is_admin por su cuenta: se entera por el 403.
+async function fetchAdmin(path, opts = {}){
+  const token = await getToken();
+  const res = await fetch(PC_SERVER + path, {
+    ...opts,
+    headers: { ...(opts.headers || {}), 'Authorization': 'Bearer ' + token },
+  });
+  if (res.status === 401 || res.status === 403) {
+    document.getElementById('login-msg').textContent = 'No tenés permisos de administrador para esta cuenta';
+    await logout();
+    return null;
+  }
+  return res;
+}
+
+// ── Secciones del panel ──────────────────────────────────────────────────────
+// Cada sección se carga la primera vez que se abre, no todas al entrar.
+let seccionActual = 'pedidos';
+const seccionesCargadas = {};
+
+function mostrarSeccion(sec){
+  seccionActual = sec;
+  ['pedidos','codigos'].forEach(function(s){
+    document.getElementById('sec-' + s).hidden = (s !== sec);
+    document.getElementById('tab-' + s).classList.toggle('active', s === sec);
+  });
+  if (!seccionesCargadas[sec]) actualizarSeccion();
+}
+
+function actualizarSeccion(){
+  seccionesCargadas[seccionActual] = true;
+  if (seccionActual === 'codigos') return cargarCodigos();
+  return cargarPedidos();
+}
+
 async function login(){
   const email = document.getElementById('login-email').value.trim();
   const pass  = document.getElementById('login-pass').value;
@@ -145,6 +241,8 @@ async function logout(){
 async function mostrarApp(){
   document.getElementById('login-box').style.display = 'none';
   document.getElementById('app').style.display = 'block';
+  seccionActual = 'pedidos';
+  seccionesCargadas.pedidos = true;
   await cargarPedidos();
 }
 
@@ -156,17 +254,9 @@ async function cargarPedidos(){
   cargaEl.style.display = 'block';
   vacioEl.style.display = 'none';
 
-  const token = await getToken();
   try {
-    const res = await fetch(PC_SERVER + '/admin/pedidos', {
-      headers: { 'Authorization': 'Bearer ' + token }
-    });
-    if (res.status === 401 || res.status === 403) {
-      cargaEl.style.display = 'none';
-      document.getElementById('login-msg').textContent = 'No tenés permisos de administrador para esta cuenta';
-      await logout();
-      return;
-    }
+    const res = await fetchAdmin('/admin/pedidos');
+    if (!res) { cargaEl.style.display = 'none'; return; }
     const data = await res.json();
     cargaEl.style.display = 'none';
     if (!data.pedidos || data.pedidos.length === 0) {
@@ -305,6 +395,112 @@ async function completarGrupo(pedidoIds, btnEl){
   } catch (err) {
     if (btnEl) { btnEl.disabled = false; btnEl.textContent = '✓ Marcar como completado'; }
     alert('No se pudo actualizar el pedido. Reintentá.');
+  }
+}
+
+// ── Códigos promocionales ────────────────────────────────────────────────────
+async function cargarCodigos(){
+  const listEl  = document.getElementById('codigos-list');
+  const cargaEl = document.getElementById('codigos-carga');
+  const vacioEl = document.getElementById('codigos-vacio');
+  listEl.innerHTML = '';
+  cargaEl.textContent = 'Cargando códigos...';
+  cargaEl.style.display = 'block';
+  vacioEl.style.display = 'none';
+
+  try {
+    const res = await fetchAdmin('/admin/codigos');
+    if (!res) { cargaEl.style.display = 'none'; return; }
+    const data = await res.json();
+    cargaEl.style.display = 'none';
+    if (!data.codigos || data.codigos.length === 0) {
+      vacioEl.style.display = 'block';
+      return;
+    }
+    data.codigos.forEach(c => listEl.appendChild(renderCodigo(c)));
+  } catch (err) {
+    cargaEl.textContent = 'Error al cargar los códigos. Reintentá con el botón Actualizar.';
+  }
+}
+
+function renderCodigo(c){
+  const div = document.createElement('div');
+  div.className = 'pedido-card';
+  const valorTxt = c.tipo === 'porcentaje'
+    ? c.valor + '% de descuento'
+    : fmtMoney(c.valor) + ' de descuento';
+
+  div.innerHTML = `
+    <div class="pedido-head">
+      <div class="pedido-id">${escapeHtml(c.codigo)}</div>
+      <div class="estado-badge ${c.activo ? 'estado-activo' : 'estado-inactivo'}">${c.activo ? 'activo' : 'inactivo'}</div>
+    </div>
+    <div class="cod-info">
+      <strong>${escapeHtml(valorTxt)}</strong><br>
+      ${c.descripcion ? escapeHtml(c.descripcion) + '<br>' : ''}
+      Usado ${c.usos} ${c.usos === 1 ? 'vez' : 'veces'} · creado ${fmtFecha(c.created_at)}
+    </div>
+  `;
+
+  const btn = document.createElement('button');
+  btn.className = c.activo ? 'desactivar-btn' : 'completar-btn';
+  btn.textContent = c.activo ? 'Desactivar' : 'Activar';
+  btn.onclick = () => cambiarEstadoCodigo(c.codigo, !c.activo, btn);
+  div.appendChild(btn);
+  return div;
+}
+
+async function cambiarEstadoCodigo(codigo, activo, btnEl){
+  const original = btnEl.textContent;
+  btnEl.disabled = true;
+  btnEl.textContent = 'Guardando...';
+  try {
+    const res = await fetchAdmin('/admin/codigos/' + encodeURIComponent(codigo) + '/estado', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ activo }),
+    });
+    if (!res) return;
+    if (!res.ok) throw new Error();
+    await cargarCodigos();
+  } catch (err) {
+    btnEl.disabled = false;
+    btnEl.textContent = original;
+    alert('No se pudo cambiar el estado del código. Reintentá.');
+  }
+}
+
+async function crearCodigo(btnEl){
+  const msgEl = document.getElementById('cod-msg');
+  const mostrar = (texto, clase) => { msgEl.textContent = texto; msgEl.className = 'cod-msg show ' + clase; };
+
+  const codigo      = document.getElementById('cod-codigo').value.trim().toUpperCase();
+  const tipo        = document.getElementById('cod-tipo').value;
+  const valor       = document.getElementById('cod-valor').value;
+  const descripcion = document.getElementById('cod-desc').value.trim();
+
+  if (!codigo || !valor) { mostrar('Completá el código y el valor.', 'err'); return; }
+
+  btnEl.disabled = true;
+  try {
+    const res = await fetchAdmin('/admin/codigos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ codigo, tipo, valor: Number(valor), descripcion }),
+    });
+    if (!res) return;
+    const data = await res.json();
+    if (!res.ok) { mostrar(data.error || 'No se pudo crear el código.', 'err'); return; }
+
+    mostrar('Código ' + codigo + ' creado.', 'ok');
+    document.getElementById('cod-codigo').value = '';
+    document.getElementById('cod-valor').value  = '';
+    document.getElementById('cod-desc').value   = '';
+    await cargarCodigos();
+  } catch (err) {
+    mostrar('No pudimos conectar con el servidor. Reintentá.', 'err');
+  } finally {
+    btnEl.disabled = false;
   }
 }
 

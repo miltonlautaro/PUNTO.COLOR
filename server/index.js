@@ -420,6 +420,92 @@ app.post('/admin/pedidos/:pedidoId/completar', requireAdmin, async (req, res) =>
   return res.json({ ok: true });
 });
 
+// ── Códigos promocionales: administración desde el panel ─────────────────────
+// Se valida con rigor al crear porque /checkout aplica el porcentaje sin tope:
+// un valor mal cargado (ej. 150%) descuadraría el cobro.
+const TIPOS_CODIGO = ['porcentaje', 'monto'];
+
+app.get('/admin/codigos', requireAdmin, async (req, res) => {
+  const { data: codigos, error } = await supabase
+    .from('codigos_promocionales')
+    .select('id, codigo, tipo, valor, activo, descripcion, created_at')
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+
+  // Usos por código: la tabla es chica, se cuenta en memoria en vez de hacer
+  // una consulta por cada código.
+  const { data: usos, error: usosErr } = await supabase.from('codigos_usados').select('codigo');
+  if (usosErr) return res.status(500).json({ error: usosErr.message });
+  const conteo = {};
+  usos.forEach(u => { conteo[u.codigo] = (conteo[u.codigo] || 0) + 1; });
+
+  return res.json({ codigos: codigos.map(c => ({ ...c, usos: conteo[c.codigo] || 0 })) });
+});
+
+app.post('/admin/codigos', requireAdmin, async (req, res) => {
+  const codigo      = String(req.body.codigo || '').trim().toUpperCase();
+  const tipo        = String(req.body.tipo || '').trim();
+  const valor       = Number(req.body.valor);
+  const descripcion = String(req.body.descripcion || '').trim() || null;
+
+  // El cliente escribe el código en mayúsculas y compara exacto (ver
+  // aplicarCodigoPromo en index.html), así que se guarda ya normalizado.
+  if (!/^[A-Z0-9]{3,32}$/.test(codigo)) {
+    return res.status(400).json({ error: 'El código debe tener entre 3 y 32 caracteres, solo letras y números.' });
+  }
+  if (!TIPOS_CODIGO.includes(tipo)) {
+    return res.status(400).json({ error: 'El tipo tiene que ser "porcentaje" o "monto".' });
+  }
+  if (!Number.isFinite(valor) || valor <= 0) {
+    return res.status(400).json({ error: 'El valor tiene que ser un número mayor a 0.' });
+  }
+  if (tipo === 'porcentaje' && valor > 100) {
+    return res.status(400).json({ error: 'Un descuento por porcentaje no puede superar el 100%.' });
+  }
+
+  // Chequeo previo de duplicado: no se sabe si la tabla tiene UNIQUE sobre
+  // codigo, así que no alcanza con esperar el error de la base.
+  const { data: yaExiste } = await supabase
+    .from('codigos_promocionales').select('codigo').eq('codigo', codigo).maybeSingle();
+  if (yaExiste) return res.status(409).json({ error: `Ya existe un código ${codigo}.` });
+
+  const { data, error } = await supabase
+    .from('codigos_promocionales')
+    .insert({ codigo, tipo, valor, activo: true, descripcion })
+    .select()
+    .single();
+  if (error) {
+    const duplicado = error.code === '23505';
+    return res.status(duplicado ? 409 : 500)
+      .json({ error: duplicado ? `Ya existe un código ${codigo}.` : error.message });
+  }
+
+  console.log(`🏷️  Código creado desde el panel: ${codigo} (${tipo} ${valor})`);
+  return res.status(201).json({ ok: true, codigo: data });
+});
+
+// Activar/desactivar. NUNCA se borra: codigos_usados no tiene clave foránea
+// contra esta tabla, así que un DELETE dejaría registros de uso colgados y, si
+// después se recreara el mismo código, quienes ya lo usaron seguirían
+// bloqueados por el UNIQUE (user_id, codigo). La validación del checkout ya
+// filtra por activo = true, así que desactivar alcanza.
+app.post('/admin/codigos/:codigo/estado', requireAdmin, async (req, res) => {
+  const codigo = String(req.params.codigo || '').trim().toUpperCase();
+  const activo = req.body.activo === true;
+
+  const { data, error } = await supabase
+    .from('codigos_promocionales')
+    .update({ activo })
+    .eq('codigo', codigo)
+    .select()
+    .maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: 'No se encontró ese código.' });
+
+  console.log(`🏷️  Código ${codigo} ${activo ? 'activado' : 'desactivado'} desde el panel`);
+  return res.json({ ok: true, codigo: data });
+});
+
 // ── Crear preferencia MP + registrar pedido en Supabase ──────────────────────
 // Máximo de pedidos (ítems) que se pueden combinar en un solo carrito/pago.
 // No corresponde a un límite documentado de Mercado Pago — es un resguardo
