@@ -1304,6 +1304,17 @@ footer strong{color:var(--ink)}
   cursor:pointer;margin-top:8px;transition:all .2s;
 }
 .ac-btn-logout:hover{border-color:var(--accent);color:var(--accent);}
+/* Soy estudiante */
+.est-intro{font-size:.85rem;color:var(--soft);font-weight:700;line-height:1.5;margin-bottom:10px;}
+.est-estado{
+  display:none;border-radius:12px;padding:12px 14px;
+  font-size:.86rem;font-weight:700;line-height:1.5;margin-bottom:10px;
+}
+.est-estado.show{display:block;}
+.est-estado.ok{background:rgba(46,196,182,.12);border:1.5px solid rgba(46,196,182,.5);color:#166b62;}
+.est-estado.espera{background:rgba(245,166,35,.12);border:1.5px solid rgba(245,166,35,.5);color:#7a4a00;}
+.est-estado.mal{background:rgba(232,69,60,.08);border:1.5px solid rgba(232,69,60,.4);color:var(--ink);}
+.est-hint{font-size:.75rem;color:var(--soft);text-align:center;margin-top:6px;}
 /* switch y links */
 .ac-switch{text-align:center;font-size:.8rem;color:var(--soft);margin-top:14px;}
 .ac-switch a{color:var(--accent);font-weight:800;cursor:pointer;text-decoration:none;}
@@ -1817,6 +1828,21 @@ src="https://www.facebook.com/tr?id=1742512147060663&ev=PageView&noscript=1"
 
       <div class="ac-success" id="prof-success">✅ Datos actualizados correctamente</div>
       <button class="ac-btn-primary" onclick="acSaveProfile()">Guardar cambios</button>
+
+      <!-- Va después de "Guardar cambios" a propósito: ese botón guarda los
+           datos de arriba, y la constancia se sube sola al elegir el archivo. -->
+      <div class="ac-sep">🎓 Soy estudiante</div>
+      <p class="est-intro">
+        Subí tu constancia de alumno regular y, cuando la aprobemos, tenés
+        <strong>20% de descuento</strong> en todas tus impresiones.
+        Se renueva todos los años en abril.
+      </p>
+      <div class="est-estado" id="est-estado"></div>
+      <input type="file" id="est-archivo" accept=".pdf,.jpg,.jpeg,.png" hidden onchange="acSubirConstancia(this)">
+      <button class="ac-btn-primary" id="est-btn" onclick="document.getElementById('est-archivo').click()">📎 Elegir constancia</button>
+      <div class="est-hint">PDF o foto, hasta 10 MB</div>
+      <div class="ac-err" id="est-err"></div>
+
       <button class="ac-btn-logout" onclick="acLogout()">Cerrar sesión</button>
     </div>
   </div>
@@ -3876,6 +3902,7 @@ async function acInitPage() {
     if (user) {
       acFillProfile(user);
       acShowState('ac-profile');
+      acInitEstudiante().catch(function(){});   // fire-and-forget, como el resto del módulo
     } else {
       acShowState('ac-register');
     }
@@ -4060,6 +4087,111 @@ async function acLogout() {
   await window._supabase.auth.signOut();
   acUpdateNavBtn().catch(() => {});
   acShowState('ac-register');
+}
+
+// ── Soy estudiante: constancia de alumno regular ─────────────────────────────
+// El estado se consulta al servidor, nunca a la base directo: la tabla de
+// constancias está cerrada al navegador justamente para que nadie pueda
+// escribirse "aprobada" a sí mismo.
+async function _estToken() {
+  var { data } = await window._supabase.auth.getSession();
+  return data && data.session ? data.session.access_token : null;
+}
+
+function _estFecha(iso) {
+  return new Date(iso).toLocaleDateString('es-AR', { day:'numeric', month:'long', year:'numeric' });
+}
+
+function _estMostrar(clase, texto) {
+  var caja = document.getElementById('est-estado');
+  if (!caja) return;
+  caja.textContent = texto;
+  caja.className = 'est-estado show ' + clase;
+}
+
+async function acInitEstudiante() {
+  var caja = document.getElementById('est-estado');
+  var btn  = document.getElementById('est-btn');
+  if (!caja || !btn) return;
+  acSetErr('est-err', '');
+
+  var token = await _estToken();
+  if (!token) return;
+
+  try {
+    var res = await fetch(PC_SERVER + '/constancia/mia', { headers: { Authorization: 'Bearer ' + token } });
+    if (!res.ok) throw new Error('estado no disponible');
+    var data = await res.json();
+    var c = data.constancia;
+    var beneficio = data.beneficio || {};
+
+    if (beneficio.activo) {
+      _estMostrar('ok', '✅ Beneficio activo: 20% de descuento en tus impresiones, hasta el ' + _estFecha(beneficio.venceAt) + '.');
+      btn.textContent = '📎 Subir una constancia nueva';
+    } else if (c && c.estado === 'pendiente') {
+      _estMostrar('espera', '⏳ Recibimos tu constancia y la estamos revisando. Te avisamos apenas esté lista.');
+      btn.textContent = '📎 Cambiar el archivo';
+    } else if (c && c.estado === 'rechazada') {
+      _estMostrar('mal', '❌ Tu constancia fue rechazada.' +
+        (c.motivo_rechazo ? ' Motivo: ' + c.motivo_rechazo : '') + ' Podés subir otra.');
+      btn.textContent = '📎 Subir otra constancia';
+    } else if (c && c.estado === 'aprobada') {
+      _estMostrar('espera', 'Tu beneficio venció. Subí la constancia de este año para volver a activarlo.');
+      btn.textContent = '📎 Subir la constancia nueva';
+    } else {
+      caja.className = 'est-estado';
+      btn.textContent = '📎 Elegir constancia';
+    }
+  } catch (e) {
+    // Si el servidor no responde, no se muestra estado y el botón queda igual:
+    // es información de apoyo, no bloquea nada del resto de la cuenta.
+    caja.className = 'est-estado';
+  }
+}
+
+async function acSubirConstancia(input) {
+  var archivo = input.files && input.files[0];
+  input.value = ''; // permite volver a elegir el mismo archivo si hizo falta
+  if (!archivo) return;
+
+  var btn = document.getElementById('est-btn');
+  acSetErr('est-err', '');
+
+  // Mismos límites que valida el servidor — acá es solo para avisar antes.
+  var ext = (archivo.name.split('.').pop() || '').toLowerCase();
+  if (['pdf','jpg','jpeg','png'].indexOf(ext) === -1) {
+    acSetErr('est-err', 'Solo se acepta PDF, JPG o PNG.');
+    return;
+  }
+  if (archivo.size > 10 * 1024 * 1024) {
+    acSetErr('est-err', 'El archivo es demasiado grande (máximo 10 MB).');
+    return;
+  }
+
+  var textoOriginal = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Subiendo...';
+  try {
+    var token = await _estToken();
+    if (!token) { acSetErr('est-err', 'Tu sesión expiró. Volvé a iniciar sesión.'); return; }
+
+    var fd = new FormData();
+    fd.append('archivo', archivo);
+    var res = await fetch(PC_SERVER + '/constancia', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token },
+      body: fd,
+    });
+    var data = await res.json().catch(function(){ return {}; });
+    if (!res.ok) { acSetErr('est-err', data.error || 'No pudimos subir tu constancia.'); return; }
+
+    await acInitEstudiante();
+  } catch (e) {
+    acSetErr('est-err', 'No pudimos conectarnos. Revisá tu internet e intentá de nuevo.');
+  } finally {
+    btn.disabled = false;
+    if (btn.textContent === 'Subiendo...') btn.textContent = textoOriginal;
+  }
 }
 
 async function acAutofillDireccion() {

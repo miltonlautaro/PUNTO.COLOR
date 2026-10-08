@@ -76,6 +76,24 @@
   .toolbar-acciones{display:flex;gap:8px}
   .tab-btn.active{background:var(--ink);color:#f5e8cf}
 
+  /* Constancias de alumno regular */
+  .estado-aprobada{background:#cdeee9;color:#166b62}
+  .estado-rechazada{background:#f7d6d3;color:#8d2a22}
+  .const-info{font-size:.85rem;line-height:1.6;color:#4a2e0a;margin-bottom:12px}
+  .const-info strong{color:var(--ink)}
+  .const-archivo{
+    display:inline-block;background:var(--kraft);color:var(--ink);text-decoration:none;
+    font-size:.8rem;font-weight:700;padding:7px 14px;border-radius:20px;margin-bottom:12px;
+  }
+  .const-sin-archivo{font-size:.8rem;font-style:italic;color:#999;margin-bottom:12px}
+  .const-acciones{display:flex;gap:8px;flex-wrap:wrap}
+  .const-rechazo{display:none;margin-top:12px}
+  .const-rechazo.show{display:block}
+  .const-rechazo input{
+    width:100%;padding:9px 12px;border:1px solid #ddd;border-radius:10px;
+    font-family:'Nunito',sans-serif;font-size:.9rem;margin-bottom:8px;
+  }
+
   /* Códigos promocionales */
   .estado-activo{background:#cdeee9;color:#166b62}
   .estado-inactivo{background:#e8e2d6;color:#7a6a52}
@@ -122,6 +140,7 @@
     <div class="toolbar">
       <div class="tabs">
         <button class="tab-btn active" id="tab-pedidos" onclick="mostrarSeccion('pedidos')">📦 Pedidos</button>
+        <button class="tab-btn" id="tab-constancias" onclick="mostrarSeccion('constancias')">🎓 Constancias</button>
         <button class="tab-btn" id="tab-codigos" onclick="mostrarSeccion('codigos')">🏷️ Códigos</button>
       </div>
       <div class="toolbar-acciones">
@@ -134,6 +153,12 @@
       <div id="estado-carga">Cargando pedidos...</div>
       <div id="estado-vacio" style="display:none">No hay pedidos todavía.</div>
       <div id="pedidos-list"></div>
+    </div>
+
+    <div id="sec-constancias" hidden>
+      <div id="constancias-carga">Cargando constancias...</div>
+      <div id="constancias-vacio" style="display:none">No hay constancias todavía.</div>
+      <div id="constancias-list"></div>
     </div>
 
     <div id="sec-codigos" hidden>
@@ -207,7 +232,7 @@ const seccionesCargadas = {};
 
 function mostrarSeccion(sec){
   seccionActual = sec;
-  ['pedidos','codigos'].forEach(function(s){
+  ['pedidos','constancias','codigos'].forEach(function(s){
     document.getElementById('sec-' + s).hidden = (s !== sec);
     document.getElementById('tab-' + s).classList.toggle('active', s === sec);
   });
@@ -216,7 +241,8 @@ function mostrarSeccion(sec){
 
 function actualizarSeccion(){
   seccionesCargadas[seccionActual] = true;
-  if (seccionActual === 'codigos') return cargarCodigos();
+  if (seccionActual === 'codigos')     return cargarCodigos();
+  if (seccionActual === 'constancias') return cargarConstancias();
   return cargarPedidos();
 }
 
@@ -395,6 +421,124 @@ async function completarGrupo(pedidoIds, btnEl){
   } catch (err) {
     if (btnEl) { btnEl.disabled = false; btnEl.textContent = '✓ Marcar como completado'; }
     alert('No se pudo actualizar el pedido. Reintentá.');
+  }
+}
+
+// ── Constancias de alumno regular ────────────────────────────────────────────
+async function cargarConstancias(){
+  const listEl  = document.getElementById('constancias-list');
+  const cargaEl = document.getElementById('constancias-carga');
+  const vacioEl = document.getElementById('constancias-vacio');
+  listEl.innerHTML = '';
+  cargaEl.textContent = 'Cargando constancias...';
+  cargaEl.style.display = 'block';
+  vacioEl.style.display = 'none';
+
+  try {
+    const res = await fetchAdmin('/admin/constancias');
+    if (!res) { cargaEl.style.display = 'none'; return; }
+    const data = await res.json();
+    cargaEl.style.display = 'none';
+    if (!data.constancias || data.constancias.length === 0) {
+      vacioEl.style.display = 'block';
+      return;
+    }
+    data.constancias.forEach(c => listEl.appendChild(renderConstancia(c)));
+  } catch (err) {
+    cargaEl.textContent = 'Error al cargar las constancias. Reintentá con el botón Actualizar.';
+  }
+}
+
+function renderConstancia(c){
+  const div = document.createElement('div');
+  div.className = 'pedido-card';
+  const quien = c.nombre || c.email || 'Sin nombre';
+
+  let extra = '';
+  if (c.estado === 'aprobada' && c.vence_at) {
+    extra = `<strong>Beneficio hasta:</strong> ${fmtFecha(c.vence_at)}<br>`;
+  } else if (c.estado === 'rechazada' && c.motivo_rechazo) {
+    extra = `<strong>Motivo del rechazo:</strong> ${escapeHtml(c.motivo_rechazo)}<br>`;
+  }
+
+  div.innerHTML = `
+    <div class="pedido-head">
+      <div class="pedido-id">${escapeHtml(quien)}</div>
+      <div class="estado-badge estado-${escapeHtml(c.estado)}">${escapeHtml(c.estado)}</div>
+    </div>
+    <div class="const-info">
+      ${c.email ? escapeHtml(c.email) : ''}${c.telefono ? ' · ' + escapeHtml(c.telefono) : ''}<br>
+      <strong>Subida:</strong> ${fmtFecha(c.created_at)}<br>
+      ${extra}
+    </div>
+    ${c.archivoBorrado
+      ? '<div class="const-sin-archivo">Archivo ya eliminado (se borran a los 15 días de subidos)</div>'
+      : `<a class="const-archivo" href="${c.url || '#'}" target="_blank" rel="noopener">📄 Ver constancia</a>`}
+  `;
+
+  // Sin archivo no se puede decidir nada: no hay nada que mirar.
+  if (c.archivoBorrado) return div;
+
+  const acciones = document.createElement('div');
+  acciones.className = 'const-acciones';
+
+  const aprobar = document.createElement('button');
+  aprobar.className = 'completar-btn';
+  aprobar.textContent = c.estado === 'aprobada' ? '✓ Renovar aprobación' : '✓ Aprobar';
+  aprobar.onclick = () => decidirConstancia(c.id, 'aprobar', null, aprobar);
+
+  const rechazar = document.createElement('button');
+  rechazar.className = 'desactivar-btn';
+  rechazar.textContent = '✕ Rechazar';
+
+  acciones.appendChild(aprobar);
+  acciones.appendChild(rechazar);
+  div.appendChild(acciones);
+
+  // El motivo es obligatorio y lo ve el cliente en su cuenta.
+  const caja = document.createElement('div');
+  caja.className = 'const-rechazo';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.maxLength = 300;
+  input.placeholder = 'Motivo del rechazo (lo ve el cliente)';
+  const confirmar = document.createElement('button');
+  confirmar.className = 'desactivar-btn';
+  confirmar.textContent = 'Confirmar rechazo';
+  confirmar.onclick = () => {
+    const motivo = input.value.trim();
+    if (!motivo) { alert('Escribí el motivo del rechazo.'); input.focus(); return; }
+    decidirConstancia(c.id, 'rechazar', motivo, confirmar);
+  };
+  caja.appendChild(input);
+  caja.appendChild(confirmar);
+  div.appendChild(caja);
+
+  rechazar.onclick = () => {
+    caja.classList.toggle('show');
+    if (caja.classList.contains('show')) input.focus();
+  };
+
+  return div;
+}
+
+async function decidirConstancia(id, accion, motivo, btnEl){
+  const original = btnEl.textContent;
+  btnEl.disabled = true;
+  btnEl.textContent = 'Guardando...';
+  try {
+    const res = await fetchAdmin('/admin/constancias/' + encodeURIComponent(id) + '/' + accion, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(motivo ? { motivo } : {}),
+    });
+    if (!res) return;
+    if (!res.ok) throw new Error();
+    await cargarConstancias();
+  } catch (err) {
+    btnEl.disabled = false;
+    btnEl.textContent = original;
+    alert('No se pudo guardar la decisión. Reintentá.');
   }
 }
 

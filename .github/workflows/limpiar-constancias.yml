@@ -1,0 +1,32 @@
+name: Limpiar constancias
+
+# Borra el ARCHIVO de las constancias subidas hace más de 15 días. La fila se
+# conserva a propósito: un beneficio aprobado vale hasta el 31 de marzo y el
+# motivo de un rechazo lo tiene que poder seguir leyendo el cliente. Lo que se
+# elimina es el documento con datos personales (nombre, DNI, universidad).
+#
+# Va versionado acá, y no en un servicio externo, porque es una promesa sobre
+# datos personales: así queda auditable cuándo corre y qué hace.
+
+on:
+  schedule:
+    - cron: '17 4 * * *'   # todos los días ~04:17 UTC (01:17 en Argentina)
+  workflow_dispatch:
+
+jobs:
+  limpiar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Llamar al endpoint de limpieza
+        run: |
+          respuesta=$(curl -sS -m 120 -w $'\n%{http_code}' -X POST \
+            -H "x-cron-secret: ${{ secrets.CRON_SECRET }}" \
+            https://api.puntocolorimpresiones.com/admin/limpiar-constancias)
+          codigo=$(printf '%s' "$respuesta" | tail -n1)
+          cuerpo=$(printf '%s' "$respuesta" | sed '$d')
+          echo "HTTP $codigo"
+          echo "$cuerpo"
+          if [ "$codigo" != "200" ]; then
+            echo "La limpieza falló."
+            exit 1
+          fi

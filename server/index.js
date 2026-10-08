@@ -361,8 +361,11 @@ app.post('/admin/limpiar-huerfanos', async (req, res) => {
   }
 });
 
-// ── Panel de administración: ver pedidos y archivos, marcar completados ─────
-async function requireAdmin(req, res, next) {
+// ── Autenticación ────────────────────────────────────────────────────────────
+// Exige una sesión válida y deja el usuario en req.user. Es el control que le
+// faltaba al servidor: hasta ahora solo existía requireAdmin, y el único
+// chequeo de "usuario logueado" estaba suelto dentro de /checkout.
+async function requireUser(req, res, next) {
   const authHeader = req.headers['authorization'] || '';
   const token = authHeader.replace('Bearer ', '').trim();
   if (!token) return res.status(401).json({ error: 'Se requiere sesión' });
@@ -370,14 +373,23 @@ async function requireAdmin(req, res, next) {
   const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
   if (authErr || !user) return res.status(401).json({ error: 'Sesión inválida' });
 
-  const { data: profile, error: profileErr } = await supabase
-    .from('profiles')
-    .select('is_admin')
-    .eq('id', user.id)
-    .single();
-  if (profileErr || !profile?.is_admin) return res.status(403).json({ error: 'No autorizado' });
-
+  req.user = user;
   next();
+}
+
+// Admin = usuario logueado + is_admin en su perfil. La columna is_admin solo
+// se puede cambiar desde Supabase: el navegador tiene revocado el UPDATE
+// sobre ella (si no, cualquiera se promovía a admin desde la consola).
+async function requireAdmin(req, res, next) {
+  return requireUser(req, res, async () => {
+    const { data: profile, error: profileErr } = await supabase
+      .from('profiles')
+      .select('is_admin')
+      .eq('id', req.user.id)
+      .single();
+    if (profileErr || !profile?.is_admin) return res.status(403).json({ error: 'No autorizado' });
+    next();
+  });
 }
 
 app.get('/admin/pedidos', requireAdmin, async (req, res) => {
@@ -418,6 +430,266 @@ app.post('/admin/pedidos/:pedidoId/completar', requireAdmin, async (req, res) =>
     .eq('pedido_id', pedidoId);
   if (error) return res.status(500).json({ error: error.message });
   return res.json({ ok: true });
+});
+
+// ── Constancias de alumno regular ────────────────────────────────────────────
+// Bucket propio, separado de archivos-pedidos a propósito: la limpieza de
+// huérfanos borra sin margen de edad cualquier carpeta de ese bucket que no
+// tenga una fila en `pedidos`, así que una constancia guardada ahí
+// desaparecería en la primera corrida del cron.
+const BUCKET_CONSTANCIAS = 'constancias';
+const RETENCION_CONSTANCIAS_MS = 15 * 24 * 60 * 60 * 1000;
+const EXTENSIONES_CONSTANCIA = ['pdf', 'jpg', 'jpeg', 'png'];
+const CONTENT_TYPE_CONSTANCIA = {
+  pdf: 'application/pdf', jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+};
+
+// En memoria y con un límite chico: una constancia son una o dos páginas. No
+// pasa por LibreOffice — se guarda tal cual, con su content-type real.
+const uploadConstancia = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter(req, file, cb) {
+    const ext = (file.originalname.split('.').pop() || '').toLowerCase();
+    if (!EXTENSIONES_CONSTANCIA.includes(ext)) {
+      return cb(new Error('Solo se acepta PDF, JPG o PNG.'));
+    }
+    cb(null, true);
+  },
+});
+
+// El beneficio se renueva todos los abriles: una constancia aprobada vale
+// hasta el 31 de marzo siguiente, 23:59:59 hora argentina (UTC-3), que en UTC
+// es el 1 de abril a las 02:59:59.
+function vencimientoEstudiantil(desde = new Date()) {
+  const corteDe = (anio) => Date.UTC(anio, 3, 1, 2, 59, 59);
+  const anio = desde.getUTCFullYear();
+  return new Date(desde.getTime() <= corteDe(anio) ? corteDe(anio) : corteDe(anio + 1));
+}
+
+// ¿Tiene beneficio vigente? Se mira si existe ALGUNA constancia aprobada sin
+// vencer, no la última fila: alguien aprobado puede haber subido después una
+// constancia nueva que todavía está en revisión o fue rechazada, y eso no
+// tiene por qué quitarle el beneficio que ya tenía.
+async function beneficioEstudianteVigente(userId) {
+  const { data } = await supabase
+    .from('constancias')
+    .select('vence_at')
+    .eq('user_id', userId)
+    .eq('estado', 'aprobada')
+    .gt('vence_at', new Date().toISOString())
+    .order('vence_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  return { activo: !!data, venceAt: data?.vence_at || null };
+}
+
+app.post('/constancia', procesarArchivoLimiter, requireUser, (req, res) => {
+  uploadConstancia.single('archivo')(req, res, async (err) => {
+    if (err) {
+      const msg = err.code === 'LIMIT_FILE_SIZE'
+        ? 'El archivo es demasiado grande (máximo 10 MB)'
+        : (err.message || 'Error al recibir el archivo');
+      return res.status(400).json({ error: msg });
+    }
+    if (!req.file) return res.status(400).json({ error: 'No se recibió ningún archivo' });
+
+    const ext = req.file.originalname.split('.').pop().toLowerCase();
+    // La carpeta sale del TOKEN, nunca del body: así nadie puede escribir ni
+    // leer en la carpeta de otra persona.
+    const storagePath = `${req.user.id}/${randomUUID()}.${ext}`;
+
+    try {
+      // Reemplaza la constancia en revisión anterior — la base solo admite una
+      // pendiente por persona (índice único parcial).
+      const { data: previa } = await supabase
+        .from('constancias')
+        .select('id, storage_path')
+        .eq('user_id', req.user.id)
+        .eq('estado', 'pendiente')
+        .maybeSingle();
+      if (previa) {
+        if (previa.storage_path) {
+          await supabase.storage.from(BUCKET_CONSTANCIAS).remove([previa.storage_path]);
+        }
+        await supabase.from('constancias').delete().eq('id', previa.id);
+      }
+
+      const { error: upErr } = await supabase.storage
+        .from(BUCKET_CONSTANCIAS)
+        .upload(storagePath, req.file.buffer, {
+          contentType: CONTENT_TYPE_CONSTANCIA[ext], upsert: false,
+        });
+      if (upErr) throw upErr;
+
+      const { error: insErr } = await supabase.from('constancias').insert({
+        user_id: req.user.id,
+        storage_path: storagePath,
+        nombre_archivo: req.file.originalname.slice(0, 200),
+      });
+      if (insErr) {
+        // No dejar el archivo colgado si la fila no se pudo guardar.
+        await supabase.storage.from(BUCKET_CONSTANCIAS).remove([storagePath]);
+        throw insErr;
+      }
+
+      console.log(`🎓 Constancia recibida | user=${req.user.id}`);
+      return res.status(201).json({ ok: true, estado: 'pendiente' });
+    } catch (e) {
+      console.error('constancia upload error:', e);
+      return res.status(500).json({ error: 'No pudimos guardar tu constancia. Probá de nuevo.' });
+    }
+  });
+});
+
+app.get('/constancia/mia', requireUser, async (req, res) => {
+  const { data: ultima, error } = await supabase
+    .from('constancias')
+    .select('estado, motivo_rechazo, vence_at, created_at, revisada_at, nombre_archivo, storage_path')
+    .eq('user_id', req.user.id)
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+
+  const beneficio = await beneficioEstudianteVigente(req.user.id);
+  return res.json({
+    constancia: ultima ? { ...ultima, archivoBorrado: !ultima.storage_path, storage_path: undefined } : null,
+    beneficio,
+  });
+});
+
+app.get('/admin/constancias', requireAdmin, async (req, res) => {
+  const { data: constancias, error } = await supabase
+    .from('constancias')
+    .select('id, user_id, storage_path, nombre_archivo, estado, motivo_rechazo, vence_at, created_at, revisada_at')
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json({ error: error.message });
+
+  // El email vive en auth.users, no en profiles: se trae todo de una en vez de
+  // consultar usuario por usuario.
+  const emails = {};
+  try {
+    const { data: lista } = await supabase.auth.admin.listUsers({ perPage: 1000 });
+    (lista?.users || []).forEach(u => { emails[u.id] = u.email; });
+  } catch (e) {
+    console.error('No se pudieron leer los emails de los usuarios:', e.message);
+  }
+
+  const ids = [...new Set(constancias.map(c => c.user_id))];
+  const { data: perfiles } = ids.length
+    ? await supabase.from('profiles').select('id, nombre, telefono').in('id', ids)
+    : { data: [] };
+  const porId = {};
+  (perfiles || []).forEach(p => { porId[p.id] = p; });
+
+  const conDatos = await Promise.all(constancias.map(async (c) => {
+    let url = null;
+    if (c.storage_path) {
+      // 5 minutos, mucho menos que la hora que usan los pedidos: son
+      // documentos con datos personales (nombre, DNI, universidad).
+      const { data: signed } = await supabase.storage
+        .from(BUCKET_CONSTANCIAS).createSignedUrl(c.storage_path, 300);
+      url = signed?.signedUrl || null;
+    }
+    return {
+      ...c,
+      storage_path: undefined,
+      archivoBorrado: !c.storage_path,
+      url,
+      nombre:   porId[c.user_id]?.nombre || null,
+      telefono: porId[c.user_id]?.telefono || null,
+      email:    emails[c.user_id] || null,
+    };
+  }));
+
+  return res.json({ constancias: conDatos });
+});
+
+app.post('/admin/constancias/:id/aprobar', requireAdmin, async (req, res) => {
+  const vence = vencimientoEstudiantil();
+  const { data, error } = await supabase
+    .from('constancias')
+    .update({
+      estado: 'aprobada',
+      motivo_rechazo: null,
+      vence_at: vence.toISOString(),
+      revisada_at: new Date().toISOString(),
+      revisada_por: req.user.id,
+    })
+    .eq('id', req.params.id)
+    .select()
+    .maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: 'No se encontró esa constancia.' });
+
+  console.log(`🎓 Constancia aprobada | id=${data.id} | vence ${vence.toISOString()}`);
+  return res.json({ ok: true, constancia: data });
+});
+
+app.post('/admin/constancias/:id/rechazar', requireAdmin, async (req, res) => {
+  const motivo = String(req.body.motivo || '').trim();
+  if (!motivo) return res.status(400).json({ error: 'Hace falta explicar el motivo del rechazo.' });
+
+  const { data, error } = await supabase
+    .from('constancias')
+    .update({
+      estado: 'rechazada',
+      motivo_rechazo: motivo.slice(0, 300),
+      vence_at: null,
+      revisada_at: new Date().toISOString(),
+      revisada_por: req.user.id,
+    })
+    .eq('id', req.params.id)
+    .select()
+    .maybeSingle();
+  if (error) return res.status(500).json({ error: error.message });
+  if (!data) return res.status(404).json({ error: 'No se encontró esa constancia.' });
+
+  console.log(`🎓 Constancia rechazada | id=${data.id}`);
+  return res.json({ ok: true, constancia: data });
+});
+
+// Borra el ARCHIVO a los 15 días pero conserva la fila: el beneficio aprobado
+// tiene que seguir valiendo hasta el 31 de marzo, y el motivo de un rechazo
+// tiene que poder leerlo el cliente. Lo que se elimina es el documento con
+// datos personales, que es lo que no hay que retener.
+app.post('/admin/limpiar-constancias', async (req, res) => {
+  const secret = req.headers['x-cron-secret'];
+  if (!secret || secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: 'No autorizado' });
+  }
+
+  const limite = new Date(Date.now() - RETENCION_CONSTANCIAS_MS).toISOString();
+  const resultado = { revisadas: 0, archivosEliminados: 0, errores: [] };
+
+  try {
+    const { data: viejas, error } = await supabase
+      .from('constancias')
+      .select('id, storage_path')
+      .lt('created_at', limite)
+      .not('storage_path', 'is', null);
+    if (error) throw error;
+
+    resultado.revisadas = viejas.length;
+    for (const c of viejas) {
+      try {
+        const { error: rmErr } = await supabase.storage
+          .from(BUCKET_CONSTANCIAS).remove([c.storage_path]);
+        if (rmErr) throw rmErr;
+        const { error: updErr } = await supabase
+          .from('constancias').update({ storage_path: null }).eq('id', c.id);
+        if (updErr) throw updErr;
+        resultado.archivosEliminados++;
+      } catch (e) {
+        resultado.errores.push({ id: c.id, error: e.message || String(e) });
+      }
+    }
+    return res.json(resultado);
+  } catch (err) {
+    console.error('limpiar-constancias error:', err);
+    return res.status(500).json({ error: err.message || 'Error al limpiar constancias', ...resultado });
+  }
 });
 
 // ── Códigos promocionales: administración desde el panel ─────────────────────
